@@ -1,0 +1,12 @@
+{
+  "synonym_groups": [
+    ["曝光", "展现", "imp", "impression"],
+    ["广告", "ad", "投放", "创意"],
+    ["订单", "order", "下单"],
+    ["流水", "交易额", "gmv", "营收"]
+  ],
+  "term_expansions": {
+    "支付": ["pay", "payment", "付费"],
+    "用户": ["user", "uid", "玩家"]
+  }
+}

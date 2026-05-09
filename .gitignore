@@ -1,0 +1,78 @@
+# -----------------------------------------------------------------------------
+# Schemist — 建议勿提交 / 勿写入公开议题的内容（与 .gitignore 对齐）
+# -----------------------------------------------------------------------------
+# 切勿提交：.env、API Key、数据库/Trino 密码、证书私钥、生产域名、内网 IP、
+#   真实业务表/用户样本、飞书/Lark 等应用的 app_secret、schema_table_feedback
+#   等运行期学习数据（可能含查询模式）。
+# hivebrain/：目录与说明文档可提交；从数仓拉取的 **JSON / markdown 元数据** 不提交（见文末规则）。
+# 切勿在 issue/PR/截图中暴露：同上，以及 shared_reports 里的业务报表链接。
+#
+# 环境文件约定（防止把真配置推进仓库）：
+#   - 一律忽略：`.env`、任意目录下的 `.env`、以及 `.env.*`（如 .env.local / .env.production）。
+#   - 唯一例外：`.env.example`（仅占位与说明，禁止写入真实 key/密码/内网地址）。
+# -----------------------------------------------------------------------------
+
+# Runtime logs
+logs/
+**/logs/
+*.log
+
+# Process id (local service)
+**/logs/*.pid
+*.pid
+
+# Generated shared reports (may contain business content)
+shared_reports/
+**/shared_reports/
+
+# Ephemeral SQL/CSV workspace (default under ai_service_2 or SCHEMIST_WORKSPACE_DIR)
+temp_sql_v2/
+**/temp_sql_v2/
+
+# Local secrets / environment (see header: only .env.example may be committed)
+.env
+**/.env
+.env.*
+!.env.example
+!**/.env.example
+
+# hivebrain：保留目录结构与 README/示例 SQL 等；不提交本地数仓库表元数据
+# （由 get_spark_table_shecme_filter.py 等生成的 json、markdown 目录）
+# 若某路径已被 Git 跟踪，需对相应文件执行 git rm --cached <path> 后再提交
+hivebrain/**/*.json
+hivebrain/**/markdown/
+
+# Schema feedback learning file (runtime; may reflect your warehouse usage)
+**/data/schema_table_feedback.json
+
+# Python bytecode / cache / packaging
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
