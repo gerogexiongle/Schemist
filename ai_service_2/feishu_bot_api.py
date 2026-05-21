@@ -26,6 +26,7 @@ from agents.sql_agent import generate_sql
 from config.settings import QUERY_RESULT_MAX_ROWS, SQL_ENGINE_DEFAULT, SQL_EXECUTOR_TIMEOUT
 from skills.feishu_client import (
     FEISHU_REPLY_INTERACTIVE,
+    create_feishu_doc_from_markdown,
     get_message_content,
     get_tenant_access_token,
     parse_engine_prefix,
@@ -589,6 +590,7 @@ async def _process_feishu_message(
                 report = "**分析未成功**\n{}\n\n---\n{}".format((ar.get("error") or "")[:2000], report)
 
             share_line = ""
+            feishu_doc_line = ""
             feishu_share_id = ""
             try:
                 from app import persist_shared_report, build_shared_table_html, markdown_report_to_share_html
@@ -623,6 +625,38 @@ async def _process_feishu_message(
             except Exception as ex:
                 logger.warning("Feishu share report failed: %s", ex)
 
+            if report:
+                try:
+                    folder_token = (os.getenv("FEISHU_DOC_FOLDER_TOKEN", "") or "").strip()
+                    q_prefix = question_for_llm.strip()[:60] or "SQL AI 数据分析报告"
+                    doc_title = "{} - {}".format(
+                        q_prefix,
+                        datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    )
+                    doc_result = await create_feishu_doc_from_markdown(
+                        client=client,
+                        token=token,
+                        title=doc_title,
+                        markdown=report,
+                        folder_token=folder_token,
+                    )
+                    if doc_result.get("success") and doc_result.get("url"):
+                        feishu_doc_line = (
+                            "\n\n**飞书云文档**：\n{}\n（飞书内打开）".format(doc_result["url"])
+                        )
+                        ptrace(
+                            logger,
+                            "feishu.phase.feishu_doc",
+                            document_id=(doc_result.get("document_id") or "")[:24],
+                        )
+                    else:
+                        logger.warning(
+                            "Feishu doc not created: %s",
+                            doc_result.get("error") or "unknown",
+                        )
+                except Exception as doc_ex:
+                    logger.warning("Feishu doc creation failed: %s", doc_ex)
+
             intro = (
                 "**SQL AI 全流程完成**（生成 → 执行 → 分析）\n"
                 "引擎: {}\n行数: {}\n耗时(执行): {:.2f}s\n\n"
@@ -637,7 +671,7 @@ async def _process_feishu_message(
             )
             report_section = "**分析报告**\n{}".format(
                 report[:14000] if report else "(无报告正文)"
-            ) + share_line
+            ) + share_line + feishu_doc_line
             body = intro + "**结果预览**\n" + preview + "\n\n" + report_section
 
             card_title = "🧩 数据分析"
