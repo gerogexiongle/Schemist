@@ -28,6 +28,8 @@ shared_reports/
 # Ephemeral SQL/CSV workspace (default under ai_service_2 or SCHEMIST_WORKSPACE_DIR)
 temp_sql_v2/
 **/temp_sql_v2/
+ai_service_2/temp_sql/
+**/temp_sql/
 
 # Local secrets / environment (see header: only .env.example may be committed)
 .env
