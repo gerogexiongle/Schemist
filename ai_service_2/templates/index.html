@@ -4614,8 +4614,8 @@
                             return;
                         }
 
-                        // 获取原始问题（与普通模式一致，使用trim()）
-                        const originalQuestion = queryInput ? queryInput.value.trim() : '';
+                        const rawQuestion = queryInput ? queryInput.value.trim() : '';
+                        const originalQuestion = await composeUserQueryAsync(rawQuestion);
 
                         // 获取SQL（与普通模式一致，使用sqlEditor）
                         const sql = sqlEditor ? sqlEditor.getValue() : '';
@@ -8015,9 +8015,8 @@
                     return;
                 }
 
-                // 获取原始问题
-                const originalQuestion = queryInput ? queryInput.value.trim() : '';
-                if (!originalQuestion) {
+                const rawQuestion = queryInput ? queryInput.value.trim() : '';
+                if (!rawQuestion) {
                     alert('请输入查询问题后再生成报告');
                     return;
                 }
@@ -8052,7 +8051,7 @@
                 analysisReportSection.scrollIntoView({ behavior: 'smooth' });
 
                 try {
-                    // 构建请求数据
+                    const originalQuestion = await composeUserQueryAsync(rawQuestion);
                     const requestBody = {
                         original_question: originalQuestion,
                         sql: sql,
@@ -8064,7 +8063,8 @@
                     };
 
                     console.log('发送分析请求:', {
-                        question: originalQuestion,
+                        questionChars: originalQuestion.length,
+                        rawQuestion: rawQuestion,
                         headersCount: lastQueryHeaders.length,
                         dataCount: lastQueryResult.length,
                         chartType: chartType
