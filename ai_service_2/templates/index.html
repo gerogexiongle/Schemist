@@ -2464,6 +2464,103 @@
             };
         }
 
+        // ======================== Web 会话快照（刷新恢复） ========================
+        var LS_WEB_SESSION_ID = 'schemist_web_session_id';
+        var SS_WEB_SESSION_SNAPSHOT = 'schemist_web_session_snapshot';
+        var CLIENT_SNAPSHOT_MAX_ROWS = 400;
+        var webSessionSaveTimer = null;
+        var webSessionRestoreDone = false;
+
+        function getOrCreateWebSessionId() {
+            try {
+                var id = (localStorage.getItem(LS_WEB_SESSION_ID) || '').trim();
+                if (id) return id;
+                id = 'ws_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+                localStorage.setItem(LS_WEB_SESSION_ID, id);
+                return id;
+            } catch (e) {
+                return 'ws_' + Date.now().toString(36);
+            }
+        }
+
+        function truncateRowsForSnapshot(rows, maxN) {
+            if (!Array.isArray(rows)) return [];
+            var n = maxN || CLIENT_SNAPSHOT_MAX_ROWS;
+            if (rows.length <= n) return rows;
+            return rows.slice(0, n);
+        }
+
+        function readLocalWebSessionSnapshot() {
+            try {
+                var raw = sessionStorage.getItem(SS_WEB_SESSION_SNAPSHOT);
+                if (!raw) return null;
+                return JSON.parse(raw);
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function writeLocalWebSessionSnapshot(snap) {
+            try {
+                sessionStorage.setItem(SS_WEB_SESSION_SNAPSHOT, JSON.stringify(snap));
+            } catch (e) {
+                console.warn('sessionStorage snapshot too large, omitting data rows', e);
+                try {
+                    var lite = Object.assign({}, snap, { data: [], data_truncated: true });
+                    sessionStorage.setItem(SS_WEB_SESSION_SNAPSHOT, JSON.stringify(lite));
+                } catch (e2) { }
+            }
+        }
+
+        async function fetchWebSessionFromServer(sessionId) {
+            if (!sessionId) return null;
+            try {
+                var r = await fetch(apiUrl('/api/web-session/' + encodeURIComponent(sessionId)));
+                if (!r.ok) return null;
+                return await r.json();
+            } catch (e) {
+                return null;
+            }
+        }
+
+        async function fetchQueryResultById(queryId) {
+            if (!queryId) return null;
+            try {
+                var r = await fetch(apiUrl('/api/query-result/' + encodeURIComponent(queryId)));
+                if (!r.ok) return null;
+                var j = await r.json();
+                if (!j.found) return null;
+                return j;
+            } catch (e) {
+                return null;
+            }
+        }
+
+        async function pushWebSessionToServer(snapshot) {
+            try {
+                var r = await fetch(apiUrl('/api/web-session'), {
+                    method: 'POST',
+                    headers: buildJsonHeaders(snapshot.tid || ''),
+                    body: JSON.stringify(snapshot)
+                });
+                if (!r.ok) return null;
+                return await r.json();
+            } catch (e) {
+                console.warn('web-session save failed', e);
+                return null;
+            }
+        }
+
+        function scheduleWebSessionPersist(snapshot) {
+            if (!snapshot) return;
+            snapshot.updated_at_client = Date.now();
+            writeLocalWebSessionSnapshot(snapshot);
+            if (webSessionSaveTimer) clearTimeout(webSessionSaveTimer);
+            webSessionSaveTimer = setTimeout(function () {
+                pushWebSessionToServer(snapshot);
+            }, 450);
+        }
+
         let pipelineTracePollTimer = null;
         let pipelineTraceWatchingTid = '';
         function pipelineTraceFabShow(on) {
@@ -3322,6 +3419,9 @@
                             var fullUrl = window.location.origin + data.share_url;
                             document.getElementById('shareUrlInput').value = fullUrl;
                             var sid = data.share_id || String(data.share_url).split('/').filter(Boolean).pop();
+                            if (typeof window.saveWebSessionSnapshot === 'function') {
+                                window.saveWebSessionSnapshot(4, 'done', { share_id: sid || '' });
+                            }
                             addShareReportFavorite({
                                 shareId: sid,
                                 url: fullUrl,
@@ -4547,6 +4647,13 @@
                         window.lastSqlQueryType = sqlQueryType;
 
                         console.log('智能模式：SQL执行成功，行数:', lastQueryResult.length);
+                        if (typeof window.saveWebSessionSnapshot === 'function') {
+                            window.saveWebSessionSnapshot(2, 'running', {
+                                query_id: data.query_id,
+                                row_count: data.row_count,
+                                execution_time: data.execution_time
+                            });
+                        }
                         resolve(data);
                     } catch (error) {
                         console.error('智能模式SQL执行错误:', error);
@@ -4589,6 +4696,11 @@
                                 showChartDownloadControls();
 
                                 console.log('智能模式：可视化完成');
+                                if (typeof window.saveWebSessionSnapshot === 'function') {
+                                    window.saveWebSessionSnapshot(3, 'running', {
+                                        chart_type: chartTypeSelect ? chartTypeSelect.value : ''
+                                    });
+                                }
                                 resolve(true);
                             } catch (chartError) {
                                 console.error('智能模式图表生成错误:', chartError);
@@ -4688,6 +4800,19 @@
                             }
 
                             console.log('智能模式：报告生成完成');
+                            if (typeof window.saveWebSessionSnapshot === 'function') {
+                                window.saveWebSessionSnapshot(4, 'done', {
+                                    report_html: lastReportHtml
+                                });
+                            }
+                            saveToHistory(rawQuestion, { sql: sql }, {
+                                step: 4,
+                                status: 'done',
+                                query_id: currentQueryId,
+                                share_id: lastShareId,
+                                headers: lastQueryHeaders,
+                                data_preview: truncateRowsForSnapshot(lastQueryResult || [], 20)
+                            });
                             resolve(true);
                         } else {
                             console.error('智能模式报告生成失败:', result.error);
@@ -4722,6 +4847,9 @@
                 isSmartModeRunning = true;
                 console.log('========== 智能模式启动 ==========');
                 openPipelineTracePanel(getOrCreateFlowTrace(), true);
+                if (typeof window.saveWebSessionSnapshot === 'function') {
+                    window.saveWebSessionSnapshot(1, 'running', { smart_mode: true });
+                }
 
                 // 重置计时器
                 smartModeStartTime = Date.now();
@@ -4760,6 +4888,9 @@
 
                     // 完成
                     showSmartModeStatus(4, `🎉 全部完成！总耗时: ${totalTime}s`, true);
+                    if (typeof window.saveWebSessionSnapshot === 'function') {
+                        window.saveWebSessionSnapshot(4, 'done', { report_html: lastReportHtml });
+                    }
                     console.log('========== 智能模式完成 ==========');
                     console.log('各步骤耗时:', smartModeStepTimes.map((t, i) => `Step${i + 1}: ${t.toFixed(1)}s`).join(', '));
                     console.log('总耗时:', totalTime, 's');
@@ -4771,6 +4902,10 @@
 
                 } catch (error) {
                     console.error('智能模式执行失败:', error);
+                    if (typeof window.saveWebSessionSnapshot === 'function') {
+                        var failStep = smartModeStepTimes[3] > 0 ? 4 : (smartModeStepTimes[2] > 0 ? 3 : (smartModeStepTimes[1] > 0 ? 2 : 1));
+                        window.saveWebSessionSnapshot(failStep, 'failed', {});
+                    }
                     const totalTime = ((Date.now() - smartModeStartTime) / 1000).toFixed(1);
                     const statusEl = document.getElementById('smartModeStatusEl');
                     if (statusEl) {
@@ -4943,7 +5078,22 @@
                         const data = await response.json();
 
                         // 保存到历史记录
-                        saveToHistory(query, data);
+                        var smOn = smartModeToggle && smartModeToggle.checked;
+                        saveToHistory(query, data, {
+                            step: 1,
+                            status: smOn ? 'running' : 'done',
+                            session_id: getOrCreateWebSessionId(),
+                            tid: flowTid
+                        });
+                        if (typeof window.saveWebSessionSnapshot === 'function') {
+                            window.saveWebSessionSnapshot(1, smOn ? 'running' : 'done', {
+                                generate_meta: {
+                                    explanation: data.explanation,
+                                    tables_used: data.tables_used,
+                                    execution_plan: data.execution_plan
+                                }
+                            });
+                        }
 
                         // 更新UI显示结果
                         if (sqlEditor) sqlEditor.setValue(data.sql || '');
@@ -5043,13 +5193,25 @@
             }
 
             // 历史记录功能
-            function saveToHistory(query, result) {
+            function saveToHistory(query, result, sessionExtra) {
                 const historyItem = {
                     id: Date.now(),
                     timestamp: new Date().toISOString(),
                     query: query,
                     result: result
                 };
+                if (sessionExtra && typeof sessionExtra === 'object') {
+                    historyItem.session_id = sessionExtra.session_id || getOrCreateWebSessionId();
+                    historyItem.step = sessionExtra.step != null ? sessionExtra.step : 0;
+                    historyItem.status = sessionExtra.status || 'done';
+                    historyItem.query_id = sessionExtra.query_id || currentQueryId || '';
+                    historyItem.share_id = sessionExtra.share_id || lastShareId || '';
+                    historyItem.tid = sessionExtra.tid || currentFlowTraceId || '';
+                    if (sessionExtra.headers) historyItem.headers = sessionExtra.headers;
+                    if (sessionExtra.data_preview) {
+                        historyItem.data_preview = sessionExtra.data_preview;
+                    }
+                }
 
                 queryHistory.unshift(historyItem);
 
@@ -5580,6 +5742,21 @@
 
                         // 重置界面状态
                         resetUIState();
+
+                        if (typeof window.saveWebSessionSnapshot === 'function') {
+                            window.saveWebSessionSnapshot(2, 'done', {
+                                query_id: data.query_id,
+                                row_count: data.row_count,
+                                execution_time: data.execution_time
+                            });
+                        }
+                        saveToHistory(queryInput ? queryInput.value.trim() : '', { sql: sqlText }, {
+                            step: 2,
+                            status: 'done',
+                            query_id: data.query_id,
+                            headers: data.headers,
+                            data_preview: truncateRowsForSnapshot(data.result || [], 20)
+                        });
 
                     } catch (error) {
                         console.error('SQL执行错误:', error);
@@ -7872,6 +8049,200 @@
             // 保存最后生成的报告内容（Markdown格式）
             let lastReportMarkdown = '';
             let lastReportHtml = '';
+            let lastShareId = '';
+
+            function buildWebSessionPayload(step, status, extra) {
+                extra = extra || {};
+                var q = queryInput ? queryInput.value.trim() : '';
+                var sql = sqlEditor ? sqlEditor.getValue() : '';
+                var reportHtml = '';
+                if (typeof lastReportHtml === 'string' && lastReportHtml) {
+                    reportHtml = lastReportHtml;
+                } else if (analysisReportBody) {
+                    reportHtml = analysisReportBody.innerHTML || '';
+                }
+                var rows = window._lastQueryResult || lastQueryResult || extra.data || [];
+                var hdrs = window._lastQueryHeaders || lastQueryHeaders || extra.headers || [];
+                return {
+                    session_id: getOrCreateWebSessionId(),
+                    step: step,
+                    status: status || 'idle',
+                    tid: currentFlowTraceId || loadLastPipelineTid() || '',
+                    question: extra.question != null ? extra.question : q,
+                    sql: extra.sql != null ? extra.sql : sql,
+                    headers: hdrs,
+                    data: truncateRowsForSnapshot(rows, CLIENT_SNAPSHOT_MAX_ROWS),
+                    data_row_count: Array.isArray(rows) ? rows.length : 0,
+                    report_html: extra.report_html != null ? extra.report_html : reportHtml,
+                    query_id: extra.query_id != null ? extra.query_id : (currentQueryId || ''),
+                    share_id: extra.share_id != null ? extra.share_id : (lastShareId || ''),
+                    engine: extra.engine != null ? extra.engine : currentSqlEngine,
+                    smart_mode: extra.smart_mode != null ? extra.smart_mode : !!(smartModeToggle && smartModeToggle.checked),
+                    chart_type: extra.chart_type != null ? extra.chart_type : (chartTypeSelect ? chartTypeSelect.value : ''),
+                    generate_meta: extra.generate_meta || {},
+                    row_count: extra.row_count != null ? extra.row_count : (lastSqlExecuteRowCount || (rows ? rows.length : 0)),
+                    execution_time: extra.execution_time != null ? extra.execution_time : 0
+                };
+            }
+
+            window.saveWebSessionSnapshot = function (step, status, extra) {
+                try {
+                    var snap = buildWebSessionPayload(step, status, extra);
+                    scheduleWebSessionPersist(snap);
+                } catch (e) {
+                    console.warn('saveWebSessionSnapshot', e);
+                }
+            };
+
+            function showSessionRestoreBanner(message, opts) {
+                opts = opts || {};
+                var host = document.getElementById('sqlForm');
+                if (!host || !host.parentNode) return;
+                var el = document.getElementById('sessionRestoreBanner');
+                if (!el) {
+                    el = document.createElement('div');
+                    el.id = 'sessionRestoreBanner';
+                    el.className = 'alert alert-info alert-dismissible fade show mb-3';
+                    el.setAttribute('role', 'alert');
+                    host.parentNode.insertBefore(el, host);
+                }
+                var pollBtn = opts.showTrace
+                    ? ' <button type="button" class="btn btn-sm btn-outline-primary ms-2" id="sessionRestoreTraceBtn">查看链路</button>'
+                    : '';
+                el.innerHTML =
+                    '<div class="d-flex flex-wrap align-items-center justify-content-between gap-2">' +
+                    '<span>' + message + pollBtn + '</span>' +
+                    '<button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button></div>';
+                if (opts.showTrace) {
+                    var tb = document.getElementById('sessionRestoreTraceBtn');
+                    if (tb) {
+                        tb.addEventListener('click', function () {
+                            openPipelineTracePanelSmart();
+                        });
+                    }
+                }
+            }
+
+            function applyResultTableFromSnapshot(data, headers) {
+                if (!data || !headers || !headers.length) return;
+                var mock = { headers: headers, result: data, row_count: data.length, debug_info: {} };
+                var cleanHeaders = buildCleanHeaders(mock);
+                lastQueryResult = data;
+                lastQueryHeaders = headers;
+                if (resultTableHeader && resultTableBody && cleanHeaders.length > 0) {
+                    fillResultTableHeaderRow(cleanHeaders);
+                    resultTableIsCtrData = cleanHeaders.some(function (h) {
+                        return h === 'ctr_percentage' || h.toLowerCase().includes('ctr') || h === 'analysis_date';
+                    });
+                    resultTablePagedRows = data.slice(0, RESULT_TABLE_MAX_ROWS);
+                    resultTableCleanHeaders = cleanHeaders;
+                    resultTablePageIndex = 0;
+                    renderResultTablePage();
+                    updateResultTablePaginationUI();
+                    attachResultTableSortListeners();
+                }
+                if (rowCount) rowCount.textContent = (data.length) + ' 行';
+                if (sqlResultSection) sqlResultSection.classList.remove('d-none');
+            }
+
+            async function restoreWebSessionOnLoad() {
+                if (webSessionRestoreDone) return;
+                webSessionRestoreDone = true;
+                var local = readLocalWebSessionSnapshot();
+                var sid = getOrCreateWebSessionId();
+                var server = await fetchWebSessionFromServer(sid);
+                var snap = local;
+                if (server && server.session_id) {
+                    var lu = local && local.updated_at_client ? local.updated_at_client : 0;
+                    var su = server.updated_at ? server.updated_at * 1000 : 0;
+                    if (!snap || su >= lu) snap = server;
+                }
+                if (!snap || !snap.step) return;
+
+                if (snap.tid) {
+                    currentFlowTraceId = snap.tid;
+                    saveLastPipelineTid(snap.tid);
+                }
+                if (snap.question && queryInput) queryInput.value = snap.question;
+                if (snap.sql && sqlEditor) {
+                    sqlEditor.setValue(snap.sql);
+                    sqlEditor.refresh();
+                }
+                if (snap.engine) {
+                    currentSqlEngine = snap.engine;
+                    var engSel = document.getElementById('sqlEngineSelect');
+                    if (engSel) engSel.value = snap.engine;
+                }
+                if (smartModeToggle && snap.smart_mode) smartModeToggle.checked = true;
+
+                if (snap.step >= 1 && snap.sql) {
+                    if (resultSection) resultSection.style.display = 'block';
+                    if (explanationEl && snap.generate_meta && snap.generate_meta.explanation) {
+                        explanationEl.textContent = snap.generate_meta.explanation;
+                    }
+                }
+
+                var headers = snap.headers || [];
+                var data = snap.data || [];
+                if ((!data || !data.length) && snap.query_id) {
+                    var cached = await fetchQueryResultById(snap.query_id);
+                    if (cached && cached.found) {
+                        headers = cached.headers || headers;
+                        data = cached.result || data;
+                        currentQueryId = snap.query_id;
+                        if (cached.execution_time && executionTime) {
+                            executionTime.textContent = Number(cached.execution_time).toFixed(2);
+                        }
+                    }
+                }
+                if (snap.query_id) currentQueryId = snap.query_id;
+
+                if (snap.step >= 2 && data.length && headers.length) {
+                    applyResultTableFromSnapshot(data, headers);
+                    if (executionTime && snap.execution_time) {
+                        executionTime.textContent = Number(snap.execution_time).toFixed(2);
+                    }
+                }
+
+                if (snap.step >= 3 && data.length) {
+                    if (visualizationSection) visualizationSection.classList.remove('d-none');
+                    if (chartTypeSelect && snap.chart_type) chartTypeSelect.value = snap.chart_type;
+                    setTimeout(function () {
+                        try {
+                            populateColumnSelectors();
+                            generateChart();
+                            showChartDownloadControls();
+                        } catch (e) { console.warn('restore chart', e); }
+                    }, 400);
+                }
+
+                if (snap.step >= 4 && (snap.report_html || snap.reportHtml)) {
+                    var rh = snap.report_html || snap.reportHtml || '';
+                    lastReportHtml = rh;
+                    if (analysisReportSection) analysisReportSection.classList.remove('d-none');
+                    if (analysisReportBody) {
+                        analysisReportBody.innerHTML = rh;
+                        enhanceReportTables(analysisReportBody);
+                    }
+                    if (reportContent) reportContent.style.display = 'block';
+                    if (reportLoading) {
+                        reportLoading.classList.add('d-none');
+                        reportLoading.style.display = 'none';
+                    }
+                }
+
+                var stepNames = ['', '已生成 SQL', '已执行查询', '已可视化', '已完成报告'];
+                var msg = '已恢复上次会话（' + (stepNames[snap.step] || ('步骤' + snap.step)) + '）';
+                if (snap.data_truncated || (snap.data_row_count && data.length < snap.data_row_count)) {
+                    msg += '；表格为快照前 ' + data.length + ' 行';
+                }
+                var stillRunning = snap.status === 'running' && snap.step < 4;
+                if (stillRunning) {
+                    msg += '。刷新前任务可能未完成，可打开链路追踪查看进度（不会自动续跑）';
+                    if (snap.tid) startPipelineTracePoll(snap.tid);
+                }
+                showSessionRestoreBanner(msg, { showTrace: !!(snap.tid) });
+            }
 
             /** 去掉模型可能混入的内联样式/HTML，避免深色底+暗红字、整块红底标题等 */
             function sanitizeReportRenderedHtml(html) {
@@ -8115,6 +8486,16 @@
                         console.log('分析报告生成成功', {
                             analysisTime: data.analysis_time,
                             reportLength: data.report.length
+                        });
+                        if (typeof window.saveWebSessionSnapshot === 'function') {
+                            window.saveWebSessionSnapshot(4, 'done', { report_html: lastReportHtml });
+                        }
+                        saveToHistory(queryInput ? queryInput.value.trim() : '', { sql: sqlEditor ? sqlEditor.getValue() : '' }, {
+                            step: 4,
+                            status: 'done',
+                            query_id: currentQueryId,
+                            headers: lastQueryHeaders,
+                            data_preview: truncateRowsForSnapshot(lastQueryResult || [], 20)
                         });
                     } else {
                         // 显示错误
@@ -8488,6 +8869,9 @@
 
                 return queryType;
             }
+
+            // 所有 DOM 引用与 saveWebSessionSnapshot 就绪后再恢复（避免 const 未初始化）
+            restoreWebSessionOnLoad();
         });
     </script>
 </body>

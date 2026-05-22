@@ -44,6 +44,8 @@ from config.settings import (
 from agents.sql_agent import generate_sql
 from agents.analysis_agent import analyze_data
 from skills.sql_executor import execute_sql, cancel_query
+from skills.query_result_cache import get_query_result, put_query_result
+from skills.web_session_store import get_web_session, save_web_session
 from skills.pipeline_trace import (
     get_tid as pipeline_get_tid,
     log as pipeline_log,
@@ -162,6 +164,44 @@ class SQLCancelRequest(BaseModel):
 class SQLCancelResponse(BaseModel):
     success: bool
     message: str
+
+
+class WebSessionSaveRequest(BaseModel):
+    session_id: Optional[str] = None
+    step: int = 0
+    status: str = "idle"
+    tid: str = ""
+    question: str = ""
+    sql: str = ""
+    headers: List[str] = []
+    data: List[Dict] = []
+    report_html: str = ""
+    query_id: Optional[str] = None
+    share_id: str = ""
+    engine: str = ""
+    smart_mode: bool = False
+    chart_type: str = ""
+    generate_meta: Optional[Dict] = None
+    row_count: int = 0
+    execution_time: float = 0.0
+
+
+class WebSessionSaveResponse(BaseModel):
+    session_id: str
+    updated_at: float
+    expires_at: float
+
+
+class QueryResultCacheResponse(BaseModel):
+    found: bool
+    query_id: str = ""
+    headers: List[str] = []
+    result: List[Dict] = []
+    row_count: int = 0
+    execution_time: float = 0.0
+    sql: str = ""
+    engine: str = ""
+
 
 class DataAnalysisRequest(BaseModel):
     original_question: str
@@ -373,6 +413,20 @@ async def api_execute_sql(request: SQLExecutionRequest):
             sec=exec_time,
             err=(error or "")[:160],
         )
+        if success and query_id and results is not None:
+            try:
+                put_query_result(
+                    query_id,
+                    headers=headers or [],
+                    result=results or [],
+                    row_count=len(results or []),
+                    execution_time=exec_time,
+                    sql=request.sql,
+                    engine=request.engine,
+                    success=success,
+                )
+            except Exception as ce:
+                logger.warning("query_result_cache put failed: %s", ce)
         if success and len(results) == 0:
             di["zero_rows_hint"] = (
                 "查询成功但结果集为 0 行（前端与接口正常）。请核对：① 分区 dt 在范围内是否有数据；"
@@ -403,6 +457,56 @@ async def api_execute_sql(request: SQLExecutionRequest):
 async def api_cancel_sql(request: SQLCancelRequest):
     success, message = cancel_query(request.query_id)
     return SQLCancelResponse(success=success, message=message)
+
+
+@app.post("/api/web-session", response_model=WebSessionSaveResponse)
+async def api_save_web_session(request: WebSessionSaveRequest):
+    try:
+        payload = request.dict()
+        if request.generate_meta is not None:
+            payload["generate_meta"] = request.generate_meta
+        out = save_web_session(payload)
+        pipeline_log(
+            logger,
+            "api.web_session.save",
+            session_id=out.get("session_id"),
+            step=request.step,
+            status=request.status,
+            rows=len(request.data or []),
+        )
+        return WebSessionSaveResponse(
+            session_id=out["session_id"],
+            updated_at=float(out["updated_at"]),
+            expires_at=float(out["expires_at"]),
+        )
+    except Exception as e:
+        logger.exception("web-session save error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/web-session/{session_id}")
+async def api_get_web_session(session_id: str):
+    entry = get_web_session(session_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail="session not found or expired")
+    return entry
+
+
+@app.get("/api/query-result/{query_id}", response_model=QueryResultCacheResponse)
+async def api_get_query_result(query_id: str):
+    entry = get_query_result(query_id)
+    if not entry:
+        return QueryResultCacheResponse(found=False, query_id=query_id or "")
+    return QueryResultCacheResponse(
+        found=True,
+        query_id=entry.get("query_id") or query_id,
+        headers=entry.get("headers") or [],
+        result=entry.get("result") or [],
+        row_count=int(entry.get("row_count") or 0),
+        execution_time=float(entry.get("execution_time") or 0),
+        sql=entry.get("sql") or "",
+        engine=entry.get("engine") or "",
+    )
 
 
 @app.get("/api/health")
