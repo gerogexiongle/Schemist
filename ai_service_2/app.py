@@ -19,7 +19,7 @@ import uvicorn
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -39,6 +39,8 @@ from config.settings import (
     SQL_ENGINE_DEFAULT, QUERY_RESULT_MAX_ROWS,
     SQL_EXECUTOR_TIMEOUT,
     LLM_MODEL, LLM_MODEL_CHOICES, resolve_llm_model,
+    LLM_TIMEOUT,
+    LLM_API_URL, LLM_API_KEY,
     SERVICE_PUBLIC_ORIGIN,
 )
 from agents.sql_agent import generate_sql
@@ -103,6 +105,24 @@ _PIPELINE_SKIP_PATHS = frozenset(
     }
 )
 _PIPELINE_SKIP_PREFIXES = ("/static/", "/docs", "/redoc", "/openapi.json")
+
+
+def _build_page_agent_upstream_chat_url() -> str:
+    """
+    Build upstream OpenAI-compatible chat completions URL for PageAgent proxy.
+    Accepts either:
+      - full chat URL:  .../chat/completions
+      - base v1 URL:    .../v1
+      - base root URL:  ...
+    """
+    u = (LLM_API_URL or "").strip().rstrip("/")
+    if not u:
+        return ""
+    if u.endswith("/chat/completions"):
+        return u
+    if u.endswith("/v1"):
+        return u + "/chat/completions"
+    return u + "/v1/chat/completions"
 
 
 @app.middleware("http")
@@ -304,10 +324,59 @@ async def api_pipeline_feishu_recent(limit: int = 20):
 
 @app.get("/")
 async def get_index(request: Request):
+    # Keep real key server-side only; frontend uses proxy baseURL + public placeholder key.
+    page_agent_base_url = "/api/page-agent-proxy/v1"
+    page_agent_api_key = (os.environ.get("PAGE_AGENT_PUBLIC_KEY") or "page-agent-proxy").strip()
+    page_agent_model = (os.environ.get("PAGE_AGENT_MODEL") or LLM_MODEL or "ws/kimi-k2.6").strip()
     return templates.TemplateResponse(
         "index.html",
-        {"request": request, "query_result_max_rows": QUERY_RESULT_MAX_ROWS},
+        {
+            "request": request,
+            "query_result_max_rows": QUERY_RESULT_MAX_ROWS,
+            "page_agent_base_url": page_agent_base_url,
+            "page_agent_api_key": page_agent_api_key,
+            "page_agent_model": page_agent_model,
+        },
     )
+
+
+@app.post("/api/page-agent-proxy/v1/chat/completions")
+async def api_page_agent_proxy_chat(request: Request):
+    """
+    Browser-safe proxy for PageAgent:
+    - Frontend calls this endpoint with a non-secret key.
+    - Backend injects real LLM API key from .env and forwards to upstream.
+    """
+    upstream_url = _build_page_agent_upstream_chat_url()
+    if not upstream_url:
+        raise HTTPException(status_code=503, detail="LLM_API_URL not configured")
+    if not (LLM_API_KEY or "").strip():
+        raise HTTPException(status_code=503, detail="LLM_API_KEY not configured")
+
+    try:
+        raw_body = await request.body()
+        content_type = request.headers.get("content-type", "application/json")
+        timeout_sec = max(10, int(LLM_TIMEOUT))
+
+        async with httpx.AsyncClient(timeout=timeout_sec) as client:
+            upstream_resp = await client.post(
+                upstream_url,
+                content=raw_body,
+                headers={
+                    "Content-Type": content_type,
+                    "Authorization": f"Bearer {LLM_API_KEY}",
+                },
+            )
+        return Response(
+            content=upstream_resp.content,
+            status_code=upstream_resp.status_code,
+            media_type=upstream_resp.headers.get("content-type"),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("page-agent proxy error: %s", e)
+        raise HTTPException(status_code=502, detail=f"page-agent proxy failed: {e}")
 
 
 @app.post("/api/generate-sql", response_model=SQLGenerationResponse)
