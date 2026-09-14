@@ -2,7 +2,7 @@
 
 在飞书中 @ 机器人或私聊发送自然语言问题，由本服务完成 **Text2SQL → 在 Spark/Trino 上执行 → 生成 Markdown 分析报告**，并将结果回复到该条消息下。
 
-实现入口：`feishu_bot_api.py`（FastAPI 路由与全流程编排）、`skills/feishu_client.py`（飞书 OpenAPI、消息解析、文本/卡片回复）。与 Web 共用 `generate_sql` / `execute_sql` / `analyze_data` 及 `config/settings.py` 中的引擎与资源限制，**不引入额外的「数据源」切换层**。
+实现入口：`feishu_bot_api.py`（FastAPI 路由与全流程编排）、`skills/feishu_client.py`（飞书 OpenAPI、消息解析、文本/卡片回复）。与 Web/MCP 共用 `skills/sql_pipeline.py` 的查询流水线及 `generate_sql` / `execute_sql` / `analyze_data` 及 `config/settings.py` 中的引擎与资源限制，**不引入额外的「数据源」切换层**。
 
 飞书开放平台要求回调在约 **3 秒内返回 HTTP 200**。本服务在校验通过后 **立即返回 `{"msg":"ok"}`**，实际问数在 **`asyncio.create_task` 后台任务**中执行，避免超时。
 
@@ -60,7 +60,13 @@
 2. **自动匹配技能**（默认开启）：根据技能元数据与用户输入做轻量打分；需达到 **`FEISHU_AUTO_SKILL_MIN_SCORE`**（默认 `65`），且第一名与第二名分差 ≥ **`FEISHU_AUTO_SKILL_MARGIN`**（默认 `12`）才会自动套模板。可通过 **`FEISHU_AUTO_SKILL_MATCH=0`** 关闭。  
 3. **排除列表**：默认将 `data-insights` 排除在自动匹配之外（过泛），可通过 **`FEISHU_AUTO_SKILL_EXCLUDE_IDS`** 配置（逗号分隔 id）。
 
-### 1.8 前缀解析顺序（重要）
+### 1.8 统一执行与历史追踪
+
+全流程通过 `run_sql_pipeline` 完成预校验、执行、修复和状态快照。权限错误立即停止，未变化的修复 SQL 不会重复执行；复杂漏斗可通过独立配置进行阶段覆盖检查。
+
+飞书查询写入 Web 的查询历史，带 `source=feishu`、`question_id`、`trace_id` 和执行 `query_id`。Web 可按来源、问题编号或追踪号筛选，也可拉取最近飞书任务的 SQL、执行结果与分析快照。报表服务由应用启动时注入，避免飞书模块反向导入应用造成重复初始化。
+
+### 1.9 前缀解析顺序（重要）
 
 服务端顺序：**先整句解析「引擎」前缀，再对剩余部分解析「全流程 / 仅SQL」前缀**。
 

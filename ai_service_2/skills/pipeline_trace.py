@@ -30,6 +30,11 @@ _TTL_SEC = float((os.environ.get("PIPELINE_TRACE_UI_TTL_SEC", "3600") or "3600")
 _recent_feishu_lock = threading.Lock()
 _RECENT_FEISHU_SESSIONS: deque = deque(maxlen=40)
 
+_snapshot_lock = threading.Lock()
+_snapshot_store: Dict[str, dict] = {}
+_SNAPSHOT_SQL_MAX = int((os.environ.get("PIPELINE_TRACE_SNAPSHOT_SQL_MAX", "120000") or "120000").strip() or "120000")
+_SNAPSHOT_REPORT_MAX = int((os.environ.get("PIPELINE_TRACE_SNAPSHOT_REPORT_MAX", "80000") or "80000").strip() or "80000")
+
 
 def events_enabled() -> bool:
     raw = (os.environ.get("PIPELINE_TRACE_UI", "1") or "1").strip().lower()
@@ -103,12 +108,76 @@ def _prune_store_locked(now: float) -> None:
         _events_store.pop(t, None)
         _events_last_seen.pop(t, None)
         _events_seq.pop(t, None)
+        with _snapshot_lock:
+            _snapshot_store.pop(t, None)
     # Cap number of distinct tids (drop oldest by last_seen)
     while len(_events_store) > _MAX_TIDS:
         oldest_tid = min(_events_last_seen.keys(), key=lambda x: _events_last_seen.get(x, 0.0))
         _events_store.pop(oldest_tid, None)
         _events_last_seen.pop(oldest_tid, None)
         _events_seq.pop(oldest_tid, None)
+        with _snapshot_lock:
+            _snapshot_store.pop(oldest_tid, None)
+
+
+def _clip_snapshot_text(val: Any, maxlen: int) -> str:
+    s = (val or "") if val is not None else ""
+    s = str(s)
+    if len(s) > maxlen:
+        return s[:maxlen]
+    return s
+
+
+def update_trace_snapshot(tid: Optional[str] = None, **fields: Any) -> None:
+    """供 Web 轮询：记录 pipeline 中间态（SQL / 执行 / 报告），与 events 同 tid。"""
+    if not events_enabled():
+        return
+    t = ((tid or get_tid()) or "").strip()[:64]
+    if not t or t == "-":
+        return
+    now = time.time()
+    safe = {}
+    for k, v in fields.items():
+        if v is None:
+            continue
+        if k == "sql":
+            safe[k] = _clip_snapshot_text(v, _SNAPSHOT_SQL_MAX)
+        elif k == "report":
+            safe[k] = _clip_snapshot_text(v, _SNAPSHOT_REPORT_MAX)
+        elif k == "explanation":
+            safe[k] = _clip_snapshot_text(v, 12000)
+        elif k == "execution_plan":
+            safe[k] = _clip_snapshot_text(v, 8000)
+        elif isinstance(v, (bool, int, float)):
+            safe[k] = v
+        elif isinstance(v, list):
+            safe[k] = v
+        else:
+            safe[k] = _short(v, 2000)
+    safe["updated_at"] = now
+    with _snapshot_lock:
+        row = dict(_snapshot_store.get(t) or {})
+        row.update(safe)
+        _snapshot_store[t] = row
+    with _events_lock:
+        _events_last_seen[t] = now
+
+
+def get_trace_snapshot(tid: str) -> dict:
+    t = (tid or "").strip()[:64]
+    if not t:
+        return {}
+    now = time.time()
+    with _events_lock:
+        if t in _events_last_seen and now - _events_last_seen.get(t, 0) > _TTL_SEC:
+            _events_store.pop(t, None)
+            _events_last_seen.pop(t, None)
+            _events_seq.pop(t, None)
+            with _snapshot_lock:
+                _snapshot_store.pop(t, None)
+            return {}
+    with _snapshot_lock:
+        return dict(_snapshot_store.get(t) or {})
 
 
 def record_event(tid: str, phase: str, **kwargs: Any) -> None:
@@ -148,6 +217,8 @@ def get_trace_events(tid: str) -> List[dict]:
             _events_store.pop(t, None)
             _events_last_seen.pop(t, None)
             _events_seq.pop(t, None)
+            with _snapshot_lock:
+                _snapshot_store.pop(t, None)
             return []
         return list(_events_store[t])
 

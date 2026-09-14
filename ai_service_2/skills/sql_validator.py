@@ -46,6 +46,111 @@ def _strip_sql_comments(sql):
     return re.sub(r"--[^\n\r]*", " ", no_block)
 
 
+def _sql_word_tokens(sql):
+    """Return (upper_word, start, end, parenthesis_depth), ignoring quotes/comments."""
+    tokens = []
+    depth = 0
+    i = 0
+    quote = None
+    while i < len(sql):
+        ch = sql[i]
+        if quote:
+            if ch == quote:
+                if i + 1 < len(sql) and sql[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+            elif ch == "\\" and quote == "'" and i + 1 < len(sql):
+                i += 2
+                continue
+            i += 1
+            continue
+        if sql.startswith("--", i):
+            newline = sql.find("\n", i + 2)
+            i = len(sql) if newline < 0 else newline + 1
+            continue
+        if sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            i = len(sql) if end < 0 else end + 2
+            continue
+        if ch in ("'", '"', '`'):
+            quote = ch
+            i += 1
+            continue
+        if ch == '(':
+            depth += 1
+            i += 1
+            continue
+        if ch == ')':
+            depth = max(0, depth - 1)
+            i += 1
+            continue
+        if ch.isalpha() or ch == '_':
+            start = i
+            i += 1
+            while i < len(sql) and (sql[i].isalnum() or sql[i] in ('_', '$')):
+                i += 1
+            tokens.append((sql[start:i].upper(), start, i, depth))
+            continue
+        i += 1
+    return tokens
+
+
+def _select_list_contains_join(sql):
+    """Detect JOIN at the same query depth before that SELECT's FROM."""
+    tokens = _sql_word_tokens(sql)
+    boundaries = {'FROM', 'UNION', 'INTERSECT', 'EXCEPT'}
+    for index, (word, _, _, select_depth) in enumerate(tokens):
+        if word != 'SELECT':
+            continue
+        for next_word, _, _, next_depth in tokens[index + 1:]:
+            if next_depth < select_depth:
+                break
+            if next_depth != select_depth:
+                continue
+            if next_word in boundaries or next_word == 'SELECT':
+                break
+            if next_word == 'JOIN':
+                return True
+    return False
+
+
+def _order_by_before_set_ranges(sql):
+    """Find ORDER BY clauses followed by a set operator at the same query depth."""
+    tokens = _sql_word_tokens(sql)
+    ranges = []
+    set_operators = {'UNION', 'INTERSECT', 'EXCEPT'}
+    for index, (word, start, _, order_depth) in enumerate(tokens[:-1]):
+        next_word, _, _, next_depth = tokens[index + 1]
+        if word != 'ORDER' or next_word != 'BY' or next_depth != order_depth:
+            continue
+        for candidate, candidate_start, _, candidate_depth in tokens[index + 2:]:
+            if candidate_depth < order_depth:
+                break
+            if candidate_depth != order_depth:
+                continue
+            if candidate in set_operators:
+                ranges.append((start, candidate_start))
+                break
+            if candidate == 'ORDER':
+                break
+    return ranges
+
+
+def fix_order_by_before_set_operator(sql):
+    """Remove branch ORDER BY placed before UNION/INTERSECT/EXCEPT at the same level."""
+    if not sql:
+        return None
+    ranges = _order_by_before_set_ranges(sql)
+    if not ranges:
+        return None
+    fixed = sql
+    for start, end in reversed(ranges):
+        fixed = fixed[:start].rstrip() + "\n" + fixed[end:].lstrip()
+    logger.info("Removed %d misplaced ORDER BY clause(s) before set operator", len(ranges))
+    return fixed.strip()
+
+
 def _has_internal_statement_separator(sql):
     """True when there is a semicolon before more SQL tokens (DBAPI executes one statement)."""
     if not sql:
@@ -208,19 +313,15 @@ def validate_engine_sql(sql, engine="spark"):
             "Rewrite as one SELECT/WITH query without internal semicolons."
         )
 
-    select_clauses = []
-    outer_select = _extract_outer_select(no_comments)
-    if outer_select:
-        select_clauses.append(outer_select)
-    # Also scan CTE/subquery SELECT lists. This catches hallucinated "..., LEFT JOIN ..."
-    # before the FROM of that SELECT, which Trino reports as "mismatched input 'LEFT'".
-    select_clauses.extend(
-        m.group(1)
-        for m in re.finditer(r"\bSELECT\b([\s\S]{0,6000}?)\bFROM\b", no_comments, re.IGNORECASE)
-    )
-    if any(re.search(r"\b(left|right|inner|full|cross)\s+join\b", c, re.IGNORECASE) for c in select_clauses):
+    if _select_list_contains_join(no_comments):
         issues.append(
             "JOIN keyword appears inside SELECT list before FROM; likely missing FROM/parenthesis/comma before JOIN"
+        )
+
+    if _order_by_before_set_ranges(no_comments):
+        issues.append(
+            "ORDER BY appears before UNION/INTERSECT/EXCEPT at the same query level; "
+            "put ORDER BY after the complete set operation"
         )
 
     for m in re.finditer(GROUP_BY_CLAUSE_RE, no_comments, re.IGNORECASE):
@@ -252,6 +353,52 @@ def validate_engine_sql(sql, engine="spark"):
         issues.append("Unbalanced parentheses")
 
     return issues
+
+
+def fix_trino_date_type_error(sql, error_message):
+    """Repair identifier-based varchar DATE_ADD comparisons reported by Trino."""
+    if not sql or not error_message:
+        return None
+    error_lower = error_message.lower()
+    is_date_add_signature_error = (
+        "date_add" in error_lower
+        and ("unexpected parameters" in error_lower or "function_not_found" in error_lower)
+        and "varchar" in error_lower
+    )
+    is_date_comparison_error = (
+        "cannot apply operator" in error_lower
+        and "varchar" in error_lower
+        and ("timestamp" in error_lower or "date" in error_lower)
+    )
+    if not (is_date_add_signature_error or is_date_comparison_error):
+        return None
+
+    identifier = r"[a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?"
+    cast_comparison = re.compile(
+        r"(?P<left>{identifier})\s*=\s*"
+        r"DATE_ADD\(\s*(?P<unit>'day')\s*,\s*(?P<amount>[+-]?\d+)\s*,\s*"
+        r"CAST\(\s*(?P<right>{identifier})\s+AS\s+"
+        r"(?:TIMESTAMP(?:\s*\(\s*\d+\s*\))?|DATE)\s*\)\s*\)".format(
+            identifier=identifier
+        ),
+        re.IGNORECASE,
+    )
+    bare_comparison = re.compile(
+        r"(?P<left>{identifier})\s*=\s*"
+        r"DATE_ADD\(\s*(?P<unit>'day')\s*,\s*(?P<amount>[+-]?\d+)\s*,\s*"
+        r"(?P<right>{identifier})\s*\)".format(identifier=identifier),
+        re.IGNORECASE,
+    )
+
+    def replace_comparison(match):
+        return (
+            "CAST({left} AS DATE) = DATE_ADD({unit}, {amount}, "
+            "CAST({right} AS DATE))"
+        ).format(**match.groupdict())
+
+    fixed = cast_comparison.sub(replace_comparison, sql)
+    fixed = bare_comparison.sub(replace_comparison, fixed)
+    return fixed if fixed != sql else None
 
 
 def auto_fix_agg_sql(sql):
@@ -387,16 +534,19 @@ def _parse_cte_definitions(sql):
 
 
 def _extract_cte_select_columns(cte_body):
-    body_upper = cte_body.upper().strip()
+    # 注释不参与 SELECT 列解析，否则 `-- 说明\nSELECT ...` 会被误判为空列集合，
+    # 随后把外层引用列全部重复插入 CTE。
+    clean_body = _strip_sql_comments(cte_body)
+    body_upper = clean_body.upper().strip()
     if not body_upper.startswith('SELECT'):
         return set()
 
-    from_pos = _find_keyword_at_depth0(cte_body, 'FROM')
+    from_pos = _find_keyword_at_depth0(clean_body, 'FROM')
     if from_pos < 0:
         return set()
 
-    select_start = cte_body.upper().index('SELECT') + 6
-    select_clause = cte_body[select_start:from_pos].strip()
+    select_start = clean_body.upper().index('SELECT') + 6
+    select_clause = clean_body[select_start:from_pos].strip()
     cols = _split_select_columns(select_clause)
 
     col_names = set()

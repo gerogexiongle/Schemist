@@ -11,19 +11,74 @@ from skills.schema_skill import (
     skill_search_tables,
     skill_get_table_info,
     fix_columns_by_schema,
-    build_table_catalog,
+    extract_tables_from_sql,
     list_unknown_tables_in_sql,
 )
-from config.settings import SQL_AGENT_HISTORY_MAX_TURNS, SQL_AGENT_HISTORY_MAX_CHARS
+from config.settings import (
+    SQL_AGENT_CATALOG_TOP_N,
+    SQL_AGENT_COMPLEX_GET_TABLE_INFO_LIMIT,
+    SQL_AGENT_COMPLEX_MAX_TOOL_ROUNDS,
+    SQL_AGENT_COMPLEX_MAX_TOTAL_TOOL_CALLS,
+    SQL_AGENT_COMPLEX_SEARCH_TABLES_LIMIT,
+    SQL_AGENT_COMPLEX_TABLE_THRESHOLD,
+    SQL_AGENT_FALLBACK_MODEL,
+    SQL_AGENT_FALLBACK_MAX_RETRIES,
+    SQL_AGENT_FALLBACK_TIMEOUT,
+    SQL_AGENT_FINAL_FALLBACK_TIMEOUT,
+    SQL_AGENT_GET_TABLE_INFO_LIMIT,
+    SQL_AGENT_HISTORY_MAX_CHARS,
+    SQL_AGENT_HISTORY_MAX_TURNS,
+    SQL_AGENT_MAX_TOOL_ROUNDS,
+    SQL_AGENT_MAX_TOTAL_TOOL_CALLS,
+    SQL_AGENT_REPAIR_FALLBACK_TIMEOUT,
+    SQL_AGENT_SEARCH_TABLES_LIMIT,
+    SQL_AGENT_STRONG_MODELS,
+)
+from skills.complex_query_retrieval import (
+    build_complex_query_plan,
+    build_complex_retrieval_context,
+    build_semantic_recovery_context,
+    evaluate_semantic_coverage,
+)
 from skills.sql_validator import (
     auto_fix_agg_sql,
     fix_cte_missing_columns,
+    fix_order_by_before_set_operator,
+    format_sql_error_context,
     validate_engine_sql,
     validate_generated_sql,
 )
 from skills.pipeline_trace import log as pipeline_log
 
 logger = logging.getLogger("sql_agent")
+
+_STUB_SQL_RE = re.compile(
+    r"上\s*述\s*SQL|上\s*面\s*(?:的)?\s*SQL|见\s*上|如\s*上|\(\s*略\s*\)|略\s*\)"
+    r"|省\s*略|此\s*处\s*SQL|placeholder\s*sql"
+    r"|完\s*整\s*SQL|完\s*整\s*sql|complete\s*sql|full\s*sql"
+    r"|\.\.\.\s*\w*\s*SQL\s*\w*\s*\.\.\.|\.\.\.\s*\w*\s*sql\s*\w*\s*\.\.\."
+    r"|\.{3,}",
+    re.IGNORECASE,
+)
+
+REPAIR_SYSTEM_PROMPT = """你是 SQL 修复专家。根据预检问题、执行错误或 0 行结果，在保持原分析意图的前提下修复 SQL。
+
+【修复纪律】
+1. 字段名、表名必须来自下方提供的表结构上下文，禁止臆造
+2. 遵守当前引擎方言（Spark SQL 3.3.1 或 Trino 425），禁止混用
+3. 最终 sql 必须是**一条**可执行语句；中间禁止分号
+4. 仅做最小必要修改以解决报告的问题，不要重写无关逻辑
+5. 枚举字段必须依据真实类型、样例值或用户确认的口径过滤，不猜测编码映射。
+
+【输出格式 — 必须遵守】
+优先输出 JSON：
+{
+  "sql": "完整可执行 SQL 原文",
+  "explanation": "说明修复了什么问题",
+  "tables_used": ["db.table1"]
+}
+也可用单独 ```sql 代码块；禁止在 sql 字段里用「上述SQL / 如上 / (略)」等占位。
+"""
 
 
 def _find_json_objects(text):
@@ -73,9 +128,9 @@ SQL_SYSTEM_PROMPT = """你是一位专业的SQL分析师和数据研发工程师
 4. 若返回 schema_meta.truncated=true 且所需列未列出，必须 full_detail=true 再拉一次
 5. 表名须为真实存在的名称；分析查询优先用分区字段(如 dt)限制扫描
 
-【业务取值 — api_type】
-- 表 dws_cn.dws_behavior_map_game_reco_i_d 等推荐行为明细中，业务常说「API 4001 / 监控数 4001」，但落库 api_type 常为五位字符串 **'40001'**。
-- 若用户写 4001，必须在 get_table_info 后按真实类型与样例值写过滤；禁止想当然写成 '4001' 导致 0 行。不确定时可生成「DISTINCT api_type 抽样」辅助 SQL 或在主 SQL 中用 IN ('4001','40001') 并在 explanation 中说明。
+【业务字段取值】
+- 枚举值必须来自表结构、样例或用户确认的口径；不能把口语编号直接当成落库值。
+- 不确定时明确说明需要核对枚举，必要时提供 DISTINCT 抽样 SQL；禁止擅自扩大过滤范围。
 
 【SQL语法强制规则】：
 6. 聚合：SELECT 含聚合函数时，非聚合列须在 GROUP BY 中
@@ -130,6 +185,23 @@ Trino 425：
   "tables_used": ["database.table1", "database.table2"],
   "execution_plan": ""
 }"""
+
+SQL_FINALIZATION_PROMPT = """工具检索阶段已经结束。现在禁止调用任何工具，也不要继续解释检索过程。
+请只根据前面已经取得的候选表与字段信息，立即输出一个 JSON 对象：
+{
+  "sql": "一条完整、可直接执行的 SQL 原文",
+  "explanation": "简要说明口径与关键过滤条件",
+  "tables_used": ["db.table"],
+  "execution_plan": ""
+}
+禁止省略 SQL，禁止使用“如上/上述SQL/略/...”，禁止输出多个 SQL 语句。"""
+
+
+def _is_strong_sql_model(model):
+    model_id = str(model or "").strip().lower()
+    if not model_id:
+        return False
+    return model_id in SQL_AGENT_STRONG_MODELS or model_id == SQL_AGENT_FALLBACK_MODEL.lower()
 
 
 def _build_skills():
@@ -199,7 +271,53 @@ def _trim_sql_agent_history(history):
     return out
 
 
-def create_sql_agent(engine="spark", llm_model=None):
+def _build_relevant_table_catalog(query, limit=None):
+    """Build a small local-retrieval catalog instead of injecting every known table."""
+    top_n = max(1, min(int(limit or SQL_AGENT_CATALOG_TOP_N), 80))
+    explicit_tables = _extract_explicit_db_tables(query)
+    try:
+        search_result = skill_search_tables(keyword=(query or "")[:4000], limit=top_n)
+    except Exception as e:
+        logger.warning("Initial table retrieval failed: %s", e)
+        search_result = {}
+
+    by_name = {}
+    ordered = []
+    for item in search_result.get("tables", []) if isinstance(search_result, dict) else []:
+        if not isinstance(item, dict) or not item.get("table"):
+            continue
+        table_name = str(item["table"])
+        by_name[table_name.lower()] = item
+        ordered.append(table_name)
+
+    candidates = []
+    seen = set()
+    for table_name in explicit_tables + ordered:
+        key = table_name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        item = by_name.get(key, {})
+        candidates.append({
+            "table": table_name,
+            "comment": (item.get("comment") or "用户明确指定的表")[:240],
+        })
+        if len(candidates) >= top_n:
+            break
+
+    lines = []
+    for item in candidates:
+        suffix = " -- {}".format(item["comment"]) if item.get("comment") else ""
+        lines.append("- {}{}".format(item["table"], suffix))
+    catalog = "\n".join(lines) if lines else "(本地检索未命中候选表，请使用 search_tables 定位)"
+    logger.info(
+        "Relevant table catalog: query_chars=%d tables=%d chars=%d",
+        len(query or ""), len(candidates), len(catalog),
+    )
+    return catalog
+
+
+def create_sql_agent(engine="spark", llm_model=None, query=""):
     from config.settings import LLM_MODEL
 
     engine_hint = "Spark SQL" if engine == "spark" else "Trino SQL"
@@ -212,9 +330,41 @@ def create_sql_agent(engine="spark", llm_model=None):
             "\n句末分号可有可无：本服务执行 Trino 时会自动去掉尾部分号（Python DBAPI 单条语句不接受结尾 ;）。"
         )
 
-    catalog = build_table_catalog()
-    extra += "\n\n【可用数据表目录 — 仅作定位】用 search_tables 与 get_table_info 确认真实字段；目录可能不含列信息：\n"
-    extra += catalog
+    catalog = _build_relevant_table_catalog(query)
+    extra += (
+        "\n\n【本问题相关候选表（本地检索 Top {}，仅作定位）】"
+        "\n不要把候选表当成字段依据；最终字段仍须由 get_table_info 确认：\n{}"
+    ).format(SQL_AGENT_CATALOG_TOP_N, catalog)
+
+    complex_plan = build_complex_query_plan(query)
+    complex_context = build_complex_retrieval_context(query, plan=complex_plan)
+    if complex_context.get("active"):
+        extra += "\n\n" + complex_context.get("prompt", "")
+        extra += (
+            "\n本问题属于复杂漏斗，工具预算例外调整为：search_tables 最多 {} 次、"
+            "get_table_info 最多 {} 次、总轮次最多 {}；完全相同的调用仍禁止重复。"
+        ).format(
+            SQL_AGENT_COMPLEX_SEARCH_TABLES_LIMIT,
+            SQL_AGENT_COMPLEX_GET_TABLE_INFO_LIMIT,
+            SQL_AGENT_COMPLEX_MAX_TOOL_ROUNDS,
+        )
+
+    max_iterations = (
+        SQL_AGENT_COMPLEX_MAX_TOOL_ROUNDS
+        if complex_plan.get("active") else SQL_AGENT_MAX_TOOL_ROUNDS
+    )
+    search_limit = (
+        SQL_AGENT_COMPLEX_SEARCH_TABLES_LIMIT
+        if complex_plan.get("active") else SQL_AGENT_SEARCH_TABLES_LIMIT
+    )
+    table_info_limit = (
+        SQL_AGENT_COMPLEX_GET_TABLE_INFO_LIMIT
+        if complex_plan.get("active") else SQL_AGENT_GET_TABLE_INFO_LIMIT
+    )
+    total_tool_limit = (
+        SQL_AGENT_COMPLEX_MAX_TOTAL_TOOL_CALLS
+        if complex_plan.get("active") else SQL_AGENT_MAX_TOTAL_TOOL_CALLS
+    )
 
     agent = DeepAgent(
         name="SQLGeneratorAgent",
@@ -223,8 +373,18 @@ def create_sql_agent(engine="spark", llm_model=None):
         model=llm_model or LLM_MODEL,
         temperature=0.3,
         max_tokens=4000,
-        max_iterations=8,
+        max_iterations=max_iterations,
+        force_finalize_on_limit=True,
+        finalization_prompt=SQL_FINALIZATION_PROMPT,
+        skill_call_limits={
+            "search_tables": search_limit,
+            "get_table_info": table_info_limit,
+        },
+        max_total_skill_calls=total_tool_limit,
+        block_duplicate_skill_calls=True,
     )
+    agent.complex_query_plan = complex_plan
+    agent.complex_retrieval_context = complex_context
     return agent
 
 
@@ -243,33 +403,20 @@ def _extract_explicit_db_tables(text):
     return seen
 
 
-def generate_sql(query, history=None, engine="spark", temperature=0.3, max_tokens=4000, llm_model=None):
-    start_time = time.time()
-
-    agent = create_sql_agent(engine, llm_model=llm_model)
-    user_msg = "请专注于SQL生成任务。我的问题是：{}".format(query)
-    explicit_tables = _extract_explicit_db_tables(query)
-    if explicit_tables:
-        user_msg += "\n\n【用户已点名的表（请优先依次 get_table_info，再写 SQL）】" + "、".join(explicit_tables)
-
-    try:
-        raw_response = agent.run(
-            user_message=user_msg,
-            history=_trim_sql_agent_history(history),
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-    except Exception as e:
-        pipeline_log(logger, "agent.generate_sql.fail", err=str(e)[:180])
-        logger.exception("Agent run failed: %s", e)
-        raise
-
+def parse_sql_from_llm_response(raw_response):
+    """从 LLM 回复中解析 sql / explanation / tables_used。"""
     sql = ""
     explanation = ""
     tables_used = []
     execution_plan = None
 
-    logger.info("Raw LLM response (first 1000 chars): %s", raw_response[:1000])
+    if not raw_response:
+        return {
+            "sql": sql,
+            "explanation": explanation,
+            "tables_used": tables_used,
+            "execution_plan": execution_plan,
+        }
 
     try:
         cleaned = re.sub(r"```json\s*\n?|\n?\s*```", "", raw_response).strip()
@@ -283,7 +430,7 @@ def generate_sql(query, history=None, engine="spark", temperature=0.3, max_token
         if not parsed:
             brace_positions = _find_json_objects(raw_response)
             for start, end in brace_positions:
-                candidate = raw_response[start:end+1]
+                candidate = raw_response[start:end + 1]
                 try:
                     obj = json.loads(candidate)
                     if isinstance(obj, dict) and "sql" in obj:
@@ -298,24 +445,11 @@ def generate_sql(query, history=None, engine="spark", temperature=0.3, max_token
             tables_used = parsed.get("tables_used", [])
             execution_plan = parsed.get("execution_plan", None)
 
-        # 反偷懒：模型有时正文给了完整 ```sql 代码块，又在 JSON 里用 "上述SQL / 如上 / (略) / 完整SQL"
-        # 等中文/英文占位代指，这会导致抽到的 sql 只有几十个字符、带 "(上述SQL)" 等串且不可执行。
-        # 发现这类占位时，回落到 ```sql 代码块。
-        _STUB_RE = re.compile(
-            r"上\s*述\s*SQL|上\s*面\s*(?:的)?\s*SQL|见\s*上|如\s*上|\(\s*略\s*\)|略\s*\)"
-            r"|省\s*略|此\s*处\s*SQL|placeholder\s*sql"
-            r"|完\s*整\s*SQL|完\s*整\s*sql|complete\s*sql|full\s*sql"  # 新增：避免 LLM 抄 SKILL.md 里的 <完整 SQL> 占位
-            r"|\.\.\.\s*\w*\s*SQL\s*\w*\s*\.\.\.|\.\.\.\s*\w*\s*sql\s*\w*\s*\.\.\."  # 新增：匹配 ...xxxSQL... 这种省略号包夹形式
-            r"|\.{3,}",  # 新增：任何 SQL 里出现 3 个以上点号（合法 SQL 永远不会有 ...）
-            re.IGNORECASE,
-        )
-        # 兜底长度判断：完整 AB / 多 CTE 业务 SQL 至少 800 字符；
-        # 若 JSON.sql 长度 < 800 且原文含 markdown 代码块，几乎可以肯定 JSON 占位
         sql_too_short = bool(sql) and len(sql) < 800
         fence_matches = re.findall(r"```sql\s*\n(.*?)\n\s*```", raw_response, re.DOTALL | re.IGNORECASE)
         fence_sql_candidate = fence_matches[0].strip() if fence_matches else ""
         should_fallback = (
-            (sql and _STUB_RE.search(sql))
+            (sql and _STUB_SQL_RE.search(sql))
             or (sql_too_short and fence_sql_candidate and len(fence_sql_candidate) > len(sql) * 2)
         )
         if should_fallback and fence_sql_candidate:
@@ -354,32 +488,479 @@ def generate_sql(query, history=None, engine="spark", temperature=0.3, max_token
         logger.warning("Response parsing error: %s", e)
         explanation = raw_response
 
-    # Post-processing: schema fix, CTE fix, aggregation fix
+    return {
+        "sql": sql,
+        "explanation": explanation,
+        "tables_used": tables_used,
+        "execution_plan": execution_plan,
+    }
+
+
+def postprocess_sql(sql, engine="spark", explanation=""):
+    """生成/修复后的统一后处理，并在每次自动修改后重新校验。"""
+    if not sql:
+        return {"sql": sql, "explanation": explanation, "validation_issues": ["SQL is empty"]}
+
+    auto_fixes = []
+
+    schema_fixed = fix_columns_by_schema(sql)
+    if schema_fixed:
+        logger.info("Schema auto-fix applied")
+        sql = schema_fixed
+        auto_fixes.append("schema columns")
+        logger.info("Schema auto-fix revalidation: %s", validate_engine_sql(sql, engine=engine) or "passed")
+
+    cte_fixed = fix_cte_missing_columns(sql)
+    if cte_fixed:
+        logger.info("CTE missing columns auto-fixed")
+        sql = cte_fixed
+        auto_fixes.append("CTE columns")
+        logger.info("CTE auto-fix revalidation: %s", validate_engine_sql(sql, engine=engine) or "passed")
+
+    set_order_fixed = fix_order_by_before_set_operator(sql)
+    if set_order_fixed:
+        sql = set_order_fixed
+        auto_fixes.append("set operation ORDER BY")
+        logger.info(
+            "Set-operation ORDER BY auto-fix revalidation: %s",
+            validate_engine_sql(sql, engine=engine) or "passed",
+        )
+
+    warnings = validate_generated_sql(sql)
+    engine_warnings = validate_engine_sql(sql, engine=engine)
+    if engine_warnings:
+        warnings.extend(engine_warnings)
+    if warnings:
+        warning_text = "; ".join(warnings)
+        logger.warning("SQL validation warnings: %s", warning_text)
+        fixed_sql = auto_fix_agg_sql(sql)
+        if fixed_sql:
+            logger.info("Aggregation auto-fix applied")
+            sql = fixed_sql
+            auto_fixes.append("aggregation")
+            logger.info("Aggregation auto-fix revalidation: %s", validate_engine_sql(sql, engine=engine) or "passed")
+        else:
+            explanation = "Warning: {}\n\n{}".format(warning_text, explanation)
+
+    final_issues = []
+    final_issues.extend(
+        "unknown table not in schema index: {}".format(t)
+        for t in list_unknown_tables_in_sql(sql)
+    )
+    final_issues.extend(validate_generated_sql(sql))
+    final_issues.extend(validate_engine_sql(sql, engine=engine))
+    final_issues = list(dict.fromkeys(final_issues))
+    if final_issues:
+        logger.warning("SQL validation after auto-fix: %s", "; ".join(final_issues))
+        issue_text = "; ".join(final_issues)
+        if "Warning: {}".format(issue_text) not in explanation:
+            explanation = "Warning: {}\n\n{}".format(issue_text, explanation)
+    elif auto_fixes:
+        explanation = "Auto-fixed and revalidated: {}\n\n{}".format(", ".join(auto_fixes), explanation)
+
+    return {
+        "sql": sql,
+        "explanation": explanation,
+        "validation_issues": final_issues,
+        "auto_fixes": auto_fixes,
+    }
+
+
+def _build_repair_schema_context(sql, tables_used=None):
+    """为 repair 注入相关表的全量字段信息。"""
+    from skills.schema_skill import extract_tables_from_sql
+
+    tables = []
+    for t in (tables_used or []):
+        if t and t not in tables:
+            tables.append(t)
+    for t in extract_tables_from_sql(sql or ""):
+        if t and t not in tables:
+            tables.append(t)
+
+    blocks = []
+    for table_name in tables[:8]:
+        try:
+            info = skill_get_table_info(table_name=table_name, full_detail=True)
+            if isinstance(info, dict) and info.get("columns"):
+                cols = info.get("columns") or []
+                col_lines = []
+                for c in cols[:120]:
+                    if isinstance(c, dict):
+                        col_lines.append(
+                            "  - {} ({})".format(c.get("name", "?"), c.get("type", "?"))
+                        )
+                    else:
+                        col_lines.append("  - {}".format(c))
+                blocks.append(
+                    "表 {}:\n  comment: {}\n  columns:\n{}".format(
+                        table_name,
+                        (info.get("comment") or "")[:200],
+                        "\n".join(col_lines) if col_lines else "  (无)",
+                    )
+                )
+        except Exception as e:
+            logger.warning("repair schema context failed for %s: %s", table_name, e)
+    return "\n\n".join(blocks) if blocks else "(无表结构上下文，请仅根据错误信息做最小修复)"
+
+
+def repair_sql(
+    original_question,
+    failed_sql,
+    error_message,
+    engine="spark",
+    repair_reason="execute",
+    tables_used=None,
+    llm_model=None,
+    temperature=0.15,
+    max_tokens=4000,
+    use_fallback_model=False,
+):
+    """
+    根据预检/执行错误/0 行结果修复 SQL。
+    repair_reason: precheck | execute | zero_rows
+    """
+    from config.settings import LLM_MODEL
+
+    start_time = time.time()
+    engine_hint = "Spark SQL 3.3.1" if engine == "spark" else "Trino 425"
+    schema_ctx = _build_repair_schema_context(failed_sql, tables_used=tables_used)
+    err_ctx = format_sql_error_context(failed_sql, error_message or "")
+
+    reason_map = {
+        "precheck": "SQL 未执行，预检发现以下问题",
+        "execute": "SQL 执行失败，错误信息如下",
+        "zero_rows": "SQL 执行成功但返回 0 行，请检查过滤条件/分区/枚举取值",
+    }
+    reason_text = reason_map.get(repair_reason, "需要修复 SQL")
+
+    user_msg = (
+        "{reason_text}：\n{error_message}\n\n"
+        "【原始分析需求】\n{question}\n\n"
+        "【当前引擎】{engine_hint}\n\n"
+        "【失败 SQL】\n```sql\n{failed_sql}\n```\n\n"
+        "【相关表结构 — 字段必须来自此处】\n{schema_ctx}\n"
+    ).format(
+        reason_text=reason_text,
+        error_message=(error_message or "")[:6000],
+        question=(original_question or "")[:4000],
+        engine_hint=engine_hint,
+        failed_sql=(failed_sql or "")[:50000],
+        schema_ctx=schema_ctx[:30000],
+    )
+    if err_ctx:
+        user_msg += "\n【错误行上下文】\n{}\n".format(err_ctx[:4000])
+
+    primary_model = llm_model or LLM_MODEL
+    selected_model = (
+        SQL_AGENT_FALLBACK_MODEL
+        if use_fallback_model and SQL_AGENT_FALLBACK_MODEL and not _is_strong_sql_model(primary_model)
+        else primary_model
+    )
+    agent = DeepAgent(
+        name="SQLRepairAgent",
+        system_prompt=REPAIR_SYSTEM_PROMPT + "\n当前SQL引擎: {}。".format(engine_hint),
+        skills=[],
+        model=selected_model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        max_iterations=1,
+        request_timeout=(
+            SQL_AGENT_REPAIR_FALLBACK_TIMEOUT if selected_model != primary_model else None
+        ),
+        max_retries=(SQL_AGENT_FALLBACK_MAX_RETRIES if selected_model != primary_model else None),
+    )
+
+    pipeline_log(
+        logger,
+        "agent.repair_sql.start",
+        reason=repair_reason,
+        sql_chars=len(failed_sql or ""),
+        engine=engine,
+        fallback_model=bool(selected_model != primary_model),
+    )
+    try:
+        raw_response = agent.simple_chat(
+            user_message=user_msg,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    except Exception as e:
+        pipeline_log(logger, "agent.repair_sql.fail", reason=repair_reason, err=str(e)[:180])
+        raise
+
+    parsed = parse_sql_from_llm_response(raw_response)
+    sql = (parsed.get("sql") or "").strip()
+    explanation = parsed.get("explanation") or ""
+    repaired_tables = parsed.get("tables_used") or tables_used or []
+
     if sql:
-        schema_fixed = fix_columns_by_schema(sql)
-        if schema_fixed:
-            logger.info("Schema auto-fix applied")
-            sql = schema_fixed
+        pp = postprocess_sql(sql, engine=engine, explanation=explanation)
+        sql = pp["sql"]
+        explanation = pp["explanation"]
 
-        cte_fixed = fix_cte_missing_columns(sql)
-        if cte_fixed:
-            logger.info("CTE missing columns auto-fixed")
-            sql = cte_fixed
+    elapsed = time.time() - start_time
+    pipeline_log(
+        logger,
+        "agent.repair_sql.done",
+        reason=repair_reason,
+        ok=bool(sql),
+        sql_chars=len(sql or ""),
+        sec=elapsed,
+    )
+    return {
+        "sql": sql,
+        "explanation": explanation,
+        "tables_used": repaired_tables,
+        "repair_reason": repair_reason,
+        "fallback_used": bool(selected_model != primary_model),
+        "query_time": elapsed,
+    }
 
-        warnings = validate_generated_sql(sql)
-        engine_warnings = validate_engine_sql(sql, engine=engine)
-        if engine_warnings:
-            warnings.extend(engine_warnings)
-        if warnings:
-            warning_text = "; ".join(warnings)
-            logger.warning("SQL validation warnings: %s", warning_text)
-            fixed_sql = auto_fix_agg_sql(sql)
-            if fixed_sql:
-                logger.info("Aggregation auto-fix applied")
-                explanation = "Warning: {} -> Auto-fixed\n\n{}".format(warning_text, explanation)
-                sql = fixed_sql
-            else:
-                explanation = "Warning: {}\n\n{}".format(warning_text, explanation)
+
+def generate_sql(query, history=None, engine="spark", temperature=0.3, max_tokens=4000, llm_model=None):
+    from config.settings import LLM_MODEL
+
+    start_time = time.time()
+    primary_model = llm_model or LLM_MODEL
+
+    agent = create_sql_agent(engine, llm_model=primary_model, query=query)
+    complex_plan = getattr(agent, "complex_query_plan", None) or build_complex_query_plan(query)
+    retrieval_strategy = complex_plan.get("strategy", "default")
+    user_msg = "请专注于SQL生成任务。我的问题是：{}".format(query)
+    explicit_tables = _extract_explicit_db_tables(query)
+    if explicit_tables:
+        user_msg += "\n\n【用户已点名的表（请优先依次 get_table_info，再写 SQL）】" + "、".join(explicit_tables)
+
+    try:
+        raw_response = agent.run(
+            user_message=user_msg,
+            history=_trim_sql_agent_history(history),
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+    except Exception as e:
+        pipeline_log(logger, "agent.generate_sql.fail", err=str(e)[:180])
+        logger.exception("Agent run failed: %s", e)
+        raise
+
+    logger.info("Raw LLM response (first 1000 chars): %s", raw_response[:1000])
+
+    parsed = parse_sql_from_llm_response(raw_response)
+    if not parsed.get("sql") and not agent.last_run_info.get("forced_finalization"):
+        pipeline_log(logger, "agent.generate_sql.cheap_finalize.start", model=primary_model)
+        try:
+            raw_response = agent.finalize_last_run(
+                prompt=SQL_FINALIZATION_PROMPT,
+                model=primary_model,
+                temperature=min(temperature, 0.1),
+                max_tokens=max_tokens,
+            )
+            parsed = parse_sql_from_llm_response(raw_response)
+            agent.last_run_info["forced_finalization"] = True
+            pipeline_log(
+                logger, "agent.generate_sql.cheap_finalize.done",
+                ok=bool(parsed.get("sql")), chars=len(raw_response or ""),
+            )
+        except Exception as e:
+            logger.warning("Cheap forced finalization failed: %s", e)
+            pipeline_log(logger, "agent.generate_sql.cheap_finalize.fail", err=str(e)[:180])
+
+    sql = parsed.get("sql") or ""
+    explanation = parsed.get("explanation") or ""
+    tables_used = parsed.get("tables_used") or []
+    execution_plan = parsed.get("execution_plan")
+
+    validation_issues = []
+    if sql:
+        pp = postprocess_sql(sql, engine=engine, explanation=explanation)
+        sql = pp["sql"]
+        explanation = pp["explanation"]
+        validation_issues = pp.get("validation_issues") or []
+
+    semantic_coverage = evaluate_semantic_coverage(query, sql, plan=complex_plan)
+    semantic_recovery_used = False
+    if semantic_coverage.get("applicable") and not semantic_coverage.get("complete"):
+        missing = semantic_coverage.get("missing_stages") or []
+        recovery_context = build_semantic_recovery_context(complex_plan, missing)
+        recovery_prompt = (
+            "禁止调用工具。当前 SQL 未完整覆盖用户要求的漏斗阶段，请定向补齐缺失阶段。\n"
+            "【当前 SQL】\n```sql\n{sql}\n```\n\n{context}\n\n{format_prompt}"
+        ).format(
+            sql=(sql or "(当前没有可用 SQL)")[:50000],
+            context=recovery_context[:30000],
+            format_prompt=SQL_FINALIZATION_PROMPT,
+        )
+        pipeline_log(
+            logger, "agent.generate_sql.semantic_recovery.start",
+            missing=",".join(missing), model=primary_model,
+        )
+        try:
+            recovery_raw = agent.finalize_last_run(
+                prompt=recovery_prompt,
+                model=primary_model,
+                temperature=min(temperature, 0.1),
+                max_tokens=max_tokens,
+            )
+            recovery_parsed = parse_sql_from_llm_response(recovery_raw)
+            recovery_sql = (recovery_parsed.get("sql") or "").strip()
+            recovery_issues = ["SQL is empty"]
+            recovery_coverage = evaluate_semantic_coverage(query, recovery_sql, plan=complex_plan)
+            if recovery_sql:
+                recovery_pp = postprocess_sql(
+                    recovery_sql,
+                    engine=engine,
+                    explanation=recovery_parsed.get("explanation") or "",
+                )
+                recovery_sql = recovery_pp["sql"]
+                recovery_issues = recovery_pp.get("validation_issues") or []
+                recovery_coverage = evaluate_semantic_coverage(
+                    query, recovery_sql, plan=complex_plan
+                )
+            old_count = len(semantic_coverage.get("covered_stages") or [])
+            new_count = len(recovery_coverage.get("covered_stages") or [])
+            adopt_recovery = (
+                bool(recovery_sql)
+                and len(recovery_issues) <= len(validation_issues)
+                and (recovery_coverage.get("complete") or new_count > old_count)
+            )
+            if adopt_recovery:
+                sql = recovery_sql
+                explanation = recovery_pp["explanation"]
+                tables_used = recovery_parsed.get("tables_used") or tables_used
+                execution_plan = recovery_parsed.get("execution_plan") or execution_plan
+                validation_issues = recovery_issues
+                semantic_coverage = recovery_coverage
+                semantic_recovery_used = True
+            pipeline_log(
+                logger, "agent.generate_sql.semantic_recovery.done",
+                adopted=adopt_recovery,
+                complete=bool(recovery_coverage.get("complete")),
+                covered=new_count,
+            )
+        except Exception as e:
+            logger.warning("Semantic SQL recovery failed; continuing to fallback: %s", e)
+            pipeline_log(
+                logger, "agent.generate_sql.semantic_recovery.fail", err=str(e)[:180]
+            )
+
+    sql_tables = extract_tables_from_sql(sql or "")
+    join_count = len(re.findall(r"\bJOIN\b", sql or "", re.IGNORECASE))
+    fallback_reasons = []
+    if not sql:
+        fallback_reasons.append("cheap_finalization_failed")
+    if validation_issues:
+        fallback_reasons.append("validation_failed")
+    if semantic_coverage.get("applicable") and not semantic_coverage.get("complete"):
+        fallback_reasons.append("semantic_incomplete")
+    if (
+        len(sql_tables) >= SQL_AGENT_COMPLEX_TABLE_THRESHOLD
+        and join_count >= SQL_AGENT_COMPLEX_TABLE_THRESHOLD - 1
+    ):
+        fallback_reasons.append("complex_multi_table_join")
+
+    fallback_used = False
+    primary_is_strong = _is_strong_sql_model(primary_model)
+    if fallback_reasons and primary_is_strong:
+        pipeline_log(
+            logger, "agent.generate_sql.fallback.skip",
+            reasons=",".join(fallback_reasons), primary_model=primary_model,
+            skip_reason="primary_model_already_strong",
+        )
+    if (
+        fallback_reasons
+        and not primary_is_strong
+        and SQL_AGENT_FALLBACK_MODEL
+        and SQL_AGENT_FALLBACK_MODEL != primary_model
+    ):
+        reason_text = ",".join(fallback_reasons)
+        fallback_prompt = (
+            "你是最终 SQL 审核器。禁止调用工具。请根据完整对话中的需求、候选表和字段结果，"
+            "生成或修正最终 SQL。触发原因：{reasons}。\n"
+            "当前候选 SQL：\n```sql\n{sql}\n```\n"
+            "当前校验问题：{issues}\n\n{semantic_context}\n\n{format_prompt}"
+        ).format(
+            reasons=reason_text,
+            sql=(sql or "(便宜模型未生成 SQL)")[:50000],
+            issues="; ".join(validation_issues) if validation_issues else "无",
+            semantic_context=(
+                build_semantic_recovery_context(
+                    complex_plan, semantic_coverage.get("missing_stages") or []
+                )[:30000]
+                if "semantic_incomplete" in fallback_reasons else ""
+            ),
+            format_prompt=SQL_FINALIZATION_PROMPT,
+        )
+        pipeline_log(
+            logger, "agent.generate_sql.fallback.start",
+            reasons=reason_text, model=SQL_AGENT_FALLBACK_MODEL,
+        )
+        try:
+            fallback_raw = agent.finalize_last_run(
+                prompt=fallback_prompt,
+                model=SQL_AGENT_FALLBACK_MODEL,
+                temperature=0.1,
+                max_tokens=max_tokens,
+                request_timeout=SQL_AGENT_FINAL_FALLBACK_TIMEOUT,
+                max_retries=SQL_AGENT_FALLBACK_MAX_RETRIES,
+            )
+            fallback_parsed = parse_sql_from_llm_response(fallback_raw)
+            fallback_sql = (fallback_parsed.get("sql") or "").strip()
+            fallback_issues = ["SQL is empty"]
+            if fallback_sql:
+                fallback_pp = postprocess_sql(
+                    fallback_sql,
+                    engine=engine,
+                    explanation=fallback_parsed.get("explanation") or "",
+                )
+                fallback_sql = fallback_pp["sql"]
+                fallback_issues = fallback_pp.get("validation_issues") or []
+
+            fallback_coverage = evaluate_semantic_coverage(
+                query, fallback_sql, plan=complex_plan
+            )
+            semantic_improved = (
+                fallback_coverage.get("complete")
+                or len(fallback_coverage.get("covered_stages") or [])
+                > len(semantic_coverage.get("covered_stages") or [])
+            )
+
+            if fallback_sql and (
+                (
+                    semantic_coverage.get("applicable")
+                    and semantic_improved
+                    and len(fallback_issues) <= len(validation_issues)
+                )
+                or (
+                    not semantic_coverage.get("applicable")
+                    and (not sql or len(fallback_issues) <= len(validation_issues))
+                )
+            ):
+                sql = fallback_sql
+                explanation = fallback_pp["explanation"]
+                tables_used = fallback_parsed.get("tables_used") or tables_used
+                execution_plan = fallback_parsed.get("execution_plan") or execution_plan
+                validation_issues = fallback_issues
+                semantic_coverage = fallback_coverage
+                fallback_used = True
+            pipeline_log(
+                logger, "agent.generate_sql.fallback.done",
+                adopted=fallback_used, sql_chars=len(fallback_sql or ""), issues=len(fallback_issues),
+            )
+        except Exception as e:
+            logger.warning("Strong-model SQL fallback failed; keeping cheap-model result: %s", e)
+            pipeline_log(logger, "agent.generate_sql.fallback.fail", err=str(e)[:180])
+
+    semantic_complete = bool(semantic_coverage.get("complete", True))
+    if not semantic_complete:
+        missing_labels = [
+            item.get("label") for item in semantic_coverage.get("stage_results", [])
+            if not item.get("covered")
+        ]
+        warning = "语义完整性检查未通过，缺失阶段：{}。该 SQL 不会由自动 Pipeline 执行。".format(
+            "、".join([x for x in missing_labels if x]) or "未知"
+        )
+        explanation = warning + ("\n\n" + explanation if explanation else "")
 
     elapsed = time.time() - start_time
     pipeline_log(
@@ -388,11 +969,24 @@ def generate_sql(query, history=None, engine="spark", temperature=0.3, max_token
         sql_chars=len(sql or ""),
         tables=len(tables_used or []),
         sec=elapsed,
+        fallback_used=fallback_used,
+        validation_issues=len(validation_issues),
+        semantic_complete=semantic_complete,
+        missing_stages=",".join(semantic_coverage.get("missing_stages") or []),
+        retrieval_strategy=retrieval_strategy,
     )
     return {
         "sql": sql,
         "explanation": explanation,
         "tables_used": tables_used,
         "execution_plan": execution_plan,
+        "fallback_used": fallback_used,
+        "fallback_reason": fallback_reasons,
+        "validation_issues": validation_issues,
+        "semantic_complete": semantic_complete,
+        "semantic_coverage": semantic_coverage,
+        "missing_stages": semantic_coverage.get("missing_stages") or [],
+        "retrieval_strategy": retrieval_strategy,
+        "semantic_recovery_used": semantic_recovery_used,
         "query_time": elapsed,
     }

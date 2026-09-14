@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 飞书机器人事件回调：接收用户消息 → 生成 SQL →（可选）执行 →（可选）分析报告 → 回复飞书。
-FastAPI Router：校验后快速 200，重逻辑在 asyncio 后台任务中执行。
+飞书事件订阅适配 FastAPI + Schemist 全流程。
 
 事件订阅 URL: https://你的域名/feishu/event
 飞书要求约 3 秒内返回 200，故先返回 ok，再在后台 asyncio.create_task 执行。
@@ -15,7 +15,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, Request
@@ -37,8 +37,8 @@ from skills.feishu_client import (
     reply_message,
     resolve_feishu_config_for_event,
 )
-from skills.sql_executor import execute_sql
-from skills.schema_skill import record_success_feedback_from_sql
+from skills.sql_pipeline import run_sql_pipeline, DEFAULT_MAX_RETRIES
+from skills.sql_execution_errors import get_execution_account
 from skills.pipeline_trace import (
     log as ptrace,
     new_feishu_trace_id,
@@ -59,6 +59,41 @@ _FEISHU_DEDUP_TTL_SEC = 180.0
 _history_lock = asyncio.Lock()
 _feishu_sql_history: Dict[str, List[dict]] = {}
 _FEISHU_HISTORY_MAX_MESSAGES = 10
+
+_query_recorder: Optional[Callable[..., None]] = None
+_shared_report_persister: Optional[Callable[..., dict]] = None
+_shared_table_builder: Optional[Callable[..., str]] = None
+_shared_markdown_renderer: Optional[Callable[..., str]] = None
+
+
+def set_query_recorder(recorder: Callable[..., None]) -> None:
+    """Bind Feishu history writes to the running application's history store."""
+    global _query_recorder
+    _query_recorder = recorder
+
+
+def set_shared_report_services(
+    persister: Callable[..., dict],
+    table_builder: Callable[..., str],
+    markdown_renderer: Callable[..., str],
+) -> None:
+    """Bind report helpers without importing the application module at runtime."""
+    global _shared_report_persister, _shared_table_builder, _shared_markdown_renderer
+    _shared_report_persister = persister
+    _shared_table_builder = table_builder
+    _shared_markdown_renderer = markdown_renderer
+
+
+def _record_query_safely(**kwargs) -> bool:
+    if not callable(_query_recorder):
+        logger.warning("Feishu query history recorder is not configured")
+        return False
+    try:
+        _query_recorder(**kwargs)
+        return True
+    except Exception as exc:
+        logger.exception("Feishu query history write failed: %s", exc)
+        return False
 
 
 async def _feishu_claim_delivery(dedup_key: str) -> bool:
@@ -142,11 +177,6 @@ def _skill_auto_score(skill_meta: dict, query: str) -> int:
                 score += 14
     score = min(score, 260)
 
-    if sid == "ab-experiment-multi-day":
-        if re.search(r"对照组\s*[\(（]\s*\d+\s*[\)）]", q) and re.search(r"实验组\s*[\(（]\s*\d+\s*[\)）]", q):
-            score += 170
-        if any(k in q for k in ("归因分析", "AB实验", "AB 实验", "多日归因")):
-            score += 40
     if sid == "sql-rewrite":
         if re.search(r"(改写|重写|优化).{0,20}(sql|SQL)", q, re.I):
             score += 110
@@ -155,33 +185,6 @@ def _skill_auto_score(skill_meta: dict, query: str) -> int:
     if sid == "schema-exploration":
         if any(k in q for k in ("哪些表", "什么表", "库表", "字段有哪些", "表有哪些", "表结构", "元数据", "找表", "定位表")):
             score += 95
-    if sid == "weekly-report":
-        if any(k in q for k in ("周报", "3周", "三周", "三周环比", "分发周报")):
-            score += 85
-    if sid == "client-version-top10-daily":
-        if any(k in q for k in ("TOP10", "top10", "Top10", "前十", "版本top")):
-            score += 90
-        # 口语：top版本 / Top 版本 / top 10 版本（与 TOP10 标签不等价）
-        if re.search(r"(?:^|[^\w])top\s*10(?:[^\w]|$)", q, re.I):
-            score += 92
-        if re.search(r"top\s*版本|版本\s*top", q, re.I):
-            score += 95
-        if ("分客户端" in q or "按客户端" in q or "各客户端" in q) and re.search(
-            r"\btop\b|top\s*版本|版本\s*top|top\s*10|top10", q, re.I
-        ):
-            score += 88
-        if "多日" in q and ("版本" in q or "客户端" in q) and ("趋势" in q or "迁移" in q):
-            score += 55
-        # 联机大厅 + 版本/top 倾向本技能而非仅周报
-        if ("联机大厅" in q or "api_type" in q.lower()) and (
-            "版本" in q or "客户端" in q or re.search(r"\btop\b|top10|top\s*版本", q, re.I)
-        ):
-            score += 42
-    if sid == "client-version-daily":
-        if "日报" in q and ("版本" in q or "客户端" in q or "app_version" in q.lower()):
-            score += 80
-        if "MapCard" in q or "FRONT_PAGE_FEED" in q:
-            score += 100
     return score
 
 
@@ -422,40 +425,39 @@ async def _process_feishu_message(
             history = await _get_history(session_key)
             ptrace(logger, "feishu.phase.skill", skill_id=feishu_skill_id or "-", history_msgs=len(history or []))
 
-            ptrace(logger, "feishu.phase.generate_sql.start", engine=engine)
-            try:
-                gen = await run_sync_in_executor(
-                    loop,
-                    generate_sql,
-                    question_for_llm.strip(),
-                    history or None,
-                    engine=engine,
-                )
-            except Exception as e:
-                logger.exception("Feishu generate_sql error: %s", e)
-                ptrace(logger, "feishu.phase.generate_sql.fail", err=str(e)[:180])
-                await reply_message(client, token, message_id, "生成 SQL 失败：{}".format(str(e)[:2000]))
-                return
-
-            ptrace(
-                logger,
-                "feishu.phase.generate_sql.done",
-                sql_chars=len(gen.get("sql") or ""),
-                tables=len(gen.get("tables_used") or []),
-                sec=gen.get("query_time"),
-            )
-            sql = (gen.get("sql") or "").strip()
-            explanation = gen.get("explanation") or ""
-            if not sql:
-                await reply_message(
-                    client,
-                    token,
-                    message_id,
-                    "未能从模型输出中解析出 SQL。\n说明：\n{}".format(explanation[:4000] or "(无)"),
-                )
-                return
-
             if mode == "sql_only":
+                ptrace(logger, "feishu.phase.generate_sql.start", engine=engine)
+                try:
+                    gen = await run_sync_in_executor(
+                        loop,
+                        generate_sql,
+                        question_for_llm.strip(),
+                        history or None,
+                        engine=engine,
+                    )
+                except Exception as e:
+                    logger.exception("Feishu generate_sql error: %s", e)
+                    ptrace(logger, "feishu.phase.generate_sql.fail", err=str(e)[:180])
+                    await reply_message(client, token, message_id, "生成 SQL 失败：{}".format(str(e)[:2000]))
+                    return
+
+                ptrace(
+                    logger,
+                    "feishu.phase.generate_sql.done",
+                    sql_chars=len(gen.get("sql") or ""),
+                    tables=len(gen.get("tables_used") or []),
+                    sec=gen.get("query_time"),
+                )
+                sql = (gen.get("sql") or "").strip()
+                explanation = gen.get("explanation") or ""
+                if not sql:
+                    await reply_message(
+                        client,
+                        token,
+                        message_id,
+                        "未能从模型输出中解析出 SQL。\n说明：\n{}".format(explanation[:4000] or "(无)"),
+                    )
+                    return
                 body = "**引擎**: {}\n\n**SQL**\n```sql\n{}\n```\n\n**说明**\n{}".format(
                     engine, sql, explanation[:8000] or "(无)"
                 )
@@ -470,91 +472,114 @@ async def _process_feishu_message(
                     full_user,
                     "【仅SQL】\n```sql\n{}\n```\n{}".format(sql[:4000], explanation[:2000]),
                 )
-                try:
-                    from app import record_query
-
-                    record_query(
-                        query_type="generate",
-                        engine=engine,
-                        question=question_for_llm.strip(),
-                        sql=sql,
-                        success=True,
-                        duration=gen.get("query_time", 0),
-                        tables=gen.get("tables_used") or [],
-                    )
-                except Exception:
-                    pass
+                _record_query_safely(
+                    query_type="generate",
+                    engine=engine,
+                    question=question_for_llm.strip(),
+                    sql=sql,
+                    success=True,
+                    duration=gen.get("query_time", 0),
+                    tables=gen.get("tables_used") or [],
+                    source="feishu",
+                    trace_id=tid,
+                )
                 ptrace(logger, "feishu.pipeline.branch", branch="sql_only")
                 return
 
-            ptrace(logger, "feishu.phase.execute_sql.start", sql_chars=len(sql))
+            ptrace(logger, "feishu.phase.pipeline.start", engine=engine, max_retries=DEFAULT_MAX_RETRIES)
             try:
-                success, headers, results, err, exec_time, qid, debug = await run_sync_in_executor(
+                pr = await run_sync_in_executor(
                     loop,
-                    execute_sql,
-                    sql,
+                    run_sql_pipeline,
+                    question_for_llm.strip(),
+                    history=history or None,
                     engine=engine,
+                    max_retries=DEFAULT_MAX_RETRIES,
                     max_rows=QUERY_RESULT_MAX_ROWS,
                     timeout=SQL_EXECUTOR_TIMEOUT,
+                    include_analyze=False,
                 )
             except Exception as e:
-                logger.exception("Feishu execute_sql error: %s", e)
-                ptrace(logger, "feishu.phase.execute_sql.fail", err=str(e)[:180])
-                await reply_message(
-                    client,
-                    token,
-                    message_id,
-                    "执行 SQL 异常：{}\n\n**SQL**\n```sql\n{}\n```".format(str(e)[:1500], sql[:8000]),
-                )
+                logger.exception("Feishu run_sql_pipeline error: %s", e)
+                ptrace(logger, "feishu.phase.pipeline.fail", err=str(e)[:180])
+                await reply_message(client, token, message_id, "全流程执行异常：{}".format(str(e)[:2000]))
                 return
+
+            sql = (pr.get("sql") or "").strip()
+            explanation = pr.get("explanation") or ""
+            gen = {
+                "query_time": pr.get("generate_time") or 0,
+                "tables_used": pr.get("tables_used") or [],
+            }
+            exec_block = pr.get("execution") or {}
+            attempts = pr.get("attempts") or []
 
             ptrace(
                 logger,
-                "feishu.phase.execute_sql.done",
-                ok=success,
-                exec_id=qid or "-",
-                cols=len(headers or []),
-                rows=len(results or []),
-                sec=exec_time,
-                err=(err or "")[:120],
+                "feishu.phase.pipeline.done",
+                ok=pr.get("success"),
+                sql_chars=len(sql),
+                attempts=len(attempts),
+                rows=exec_block.get("row_count") or 0,
+                sec=pr.get("pipeline_time"),
             )
-            if not success:
+
+            if not sql:
                 await reply_message(
                     client,
                     token,
                     message_id,
-                    "**执行失败**\n{}\n\n**引擎** {}\n\n**SQL**\n```sql\n{}\n```".format(
-                        (err or "unknown")[:4000], engine, sql[:8000]
-                    ),
+                    "未能从模型输出中解析出 SQL。\n说明：\n{}".format(explanation[:4000] or "(无)"),
                 )
-                try:
-                    from app import record_query
-
-                    record_query(
-                        query_type="execute",
-                        engine=engine,
-                        question=question_for_llm.strip(),
-                        sql=sql,
-                        success=False,
-                        duration=exec_time,
-                        error=err or "",
-                        row_count=0,
-                    )
-                except Exception:
-                    pass
-                ptrace(logger, "feishu.pipeline.early", reason="execute_failed", err=(err or "")[:80])
                 return
 
-            if len(results) > 0:
-                try:
-                    record_success_feedback_from_sql(
-                        sql=sql,
-                        query=question_for_llm.strip(),
-                        engine=engine,
-                        row_count=len(results),
-                    )
-                except Exception as fe:
-                    logger.warning("Feishu schema feedback record failed: %s", fe)
+            if not pr.get("success"):
+                err = pr.get("error") or exec_block.get("error") or "unknown"
+                exec_di = (exec_block.get("debug_info") or {}) if isinstance(exec_block, dict) else {}
+                is_perm = (
+                    pr.get("error_kind") == "permission_denied"
+                    or exec_di.get("error_kind") == "permission_denied"
+                    or "【权限不足" in (err or "")
+                )
+                if is_perm:
+                    title = "**权限不足 — 已停止执行**"
+                    exec_account = get_execution_account(engine)
+                    retry_note = (
+                        "\n\n请为执行账号 **{}** 申请上述表的 **SELECT** 权限，审批通过后重新提问。"
+                    ).format(exec_account)
+                else:
+                    title = "**全流程执行失败**"
+                    retry_note = ""
+                    if attempts and len(attempts) > 1:
+                        retry_note = "\n\n**自动修复重试**: 共 {} 次尝试".format(len(attempts))
+                await reply_message(
+                    client,
+                    token,
+                    message_id,
+                    "{}\n{}\n\n**引擎** {}{}\n\n**SQL**\n```sql\n{}\n```".format(
+                        title, (err or "unknown")[:4000], engine, retry_note, sql[:8000]
+                    ),
+                )
+                _record_query_safely(
+                    query_type="execute",
+                    engine=engine,
+                    question=question_for_llm.strip(),
+                    sql=sql,
+                    success=False,
+                    duration=exec_block.get("execution_time") or 0,
+                    error=err or "",
+                    row_count=0,
+                    source="feishu",
+                    query_id=exec_block.get("query_id") or "",
+                    trace_id=tid,
+                )
+                ptrace(logger, "feishu.pipeline.early", reason="pipeline_failed", err=(err or "")[:80])
+                return
+
+            headers = exec_block.get("headers") or []
+            results = exec_block.get("result") or []
+            exec_time = exec_block.get("execution_time") or 0
+            qid = exec_block.get("query_id")
 
             preview = _preview_table_markdown(headers, results, n=10)
             ptrace(logger, "feishu.phase.analyze.start", rows=len(results), cols=len(headers or []))
@@ -593,18 +618,30 @@ async def _process_feishu_message(
             feishu_doc_line = ""
             feishu_share_id = ""
             try:
-                from app import persist_shared_report, build_shared_table_html, markdown_report_to_share_html
                 from config.settings import SERVICE_PUBLIC_ORIGIN
 
-                th = build_shared_table_html(headers, results, max_rows=min(500, max(len(results), 0) or 1))
+                if not all(
+                    callable(service)
+                    for service in (
+                        _shared_report_persister,
+                        _shared_table_builder,
+                        _shared_markdown_renderer,
+                    )
+                ):
+                    raise RuntimeError("Feishu shared report services are not configured")
+                th = _shared_table_builder(
+                    headers,
+                    results,
+                    max_rows=min(500, max(len(results), 0) or 1),
+                )
                 try:
-                    rh = markdown_report_to_share_html(report if report else "")
+                    rh = _shared_markdown_renderer(report if report else "")
                 except Exception as md_err:
                     logger.warning("Feishu share markdown render failed, fallback to escaped text: %s", md_err)
                     rh = '<div class="feishu-shared-md" style="white-space:pre-wrap;">{}</div>'.format(
                         html.escape(report if report else "")
                     )
-                pr = persist_shared_report(
+                pr = _shared_report_persister(
                     report_html=rh,
                     question=question_for_llm.strip()[:8000],
                     sql=sql[:200000],
@@ -628,7 +665,7 @@ async def _process_feishu_message(
             if report:
                 try:
                     folder_token = (os.getenv("FEISHU_DOC_FOLDER_TOKEN", "") or "").strip()
-                    q_prefix = question_for_llm.strip()[:60] or "SQL AI 数据分析报告"
+                    q_prefix = question_for_llm.strip()[:60] or "Schemist 数据分析报告"
                     doc_title = "{} - {}".format(
                         q_prefix,
                         datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -658,7 +695,7 @@ async def _process_feishu_message(
                     logger.warning("Feishu doc creation failed: %s", doc_ex)
 
             intro = (
-                "**SQL AI 全流程完成**（生成 → 执行 → 分析）\n"
+                "**Schemist 全流程完成**（生成 → 执行 → 分析）\n"
                 "引擎: {}\n行数: {}\n耗时(执行): {:.2f}s\n\n"
                 "**SQL**\n```sql\n{}\n```\n\n"
                 "**模型说明**\n{}\n\n"
@@ -704,29 +741,29 @@ async def _process_feishu_message(
             )
             await _append_history(session_key, full_user, hist_assistant)
 
-            try:
-                from app import record_query
-
-                record_query(
-                    query_type="generate",
-                    engine=engine,
-                    question=question_for_llm.strip(),
-                    sql=sql,
-                    success=True,
-                    duration=gen.get("query_time", 0),
-                    tables=gen.get("tables_used") or [],
-                )
-                record_query(
-                    query_type="execute",
-                    engine=engine,
-                    question=question_for_llm.strip(),
-                    sql=sql,
-                    success=True,
-                    duration=exec_time,
-                    row_count=len(results),
-                )
-            except Exception:
-                pass
+            _record_query_safely(
+                query_type="generate",
+                engine=engine,
+                question=question_for_llm.strip(),
+                sql=sql,
+                success=True,
+                duration=gen.get("query_time", 0),
+                tables=gen.get("tables_used") or [],
+                source="feishu",
+                trace_id=tid,
+            )
+            _record_query_safely(
+                query_type="execute",
+                engine=engine,
+                question=question_for_llm.strip(),
+                sql=sql,
+                success=True,
+                duration=exec_time,
+                row_count=len(results),
+                source="feishu",
+                query_id=qid or "",
+                trace_id=tid,
+            )
 
             ptrace(
                 logger,

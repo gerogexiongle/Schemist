@@ -4,12 +4,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Schemist · Schema-Guided SQL Assistant</title>
+    <title>Schemist | Schema-Guided SQL Assistant</title>
     <link rel="icon"
         href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📊</text></svg>"
         type="image/svg+xml">
-    <meta name="description"
-        content="Schemist — Schema-Guided SQL Assistant: NL to validated SQL on Spark SQL and Trino.">
+    <meta name="description" content="Schemist - 智能生成SQL查询并可视化数据，基于你配置的数据仓库元数据">
     <meta name="author" content="Schemist contributors">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.8.1/font/bootstrap-icons.css" rel="stylesheet">
@@ -162,6 +161,167 @@
 
         .history-item:hover {
             background-color: #f5f5f5;
+        }
+
+        .query-history-content {
+            min-width: 280px;
+        }
+
+        .query-history-question {
+            color: #334155;
+            line-height: 1.4;
+            margin-bottom: 4px;
+            overflow-wrap: anywhere;
+        }
+
+        .query-history-context {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 4px 8px;
+            margin-bottom: 5px;
+            color: #64748b;
+            font-size: 10px;
+            line-height: 1.3;
+        }
+
+        .query-history-source {
+            border-radius: 3px;
+            padding: 2px 5px;
+            color: #fff;
+            font-weight: 600;
+        }
+
+        .query-history-source.source-mcp { background: #0f766e; }
+        .query-history-source.source-web { background: #475569; }
+        .query-history-source.source-feishu { background: #2563eb; }
+        .query-history-source.source-api { background: #7c3aed; }
+
+        .query-history-context code {
+            color: inherit;
+            font-size: inherit;
+        }
+
+        #statsFullscreenModal canvas {
+            width: 100% !important;
+            max-width: 100% !important;
+        }
+
+        @media (max-width: 767.98px) {
+            #statsFullscreenModal .modal-header {
+                padding-left: 12px !important;
+                padding-right: 12px !important;
+            }
+
+            #statsFullscreenModal .modal-title {
+                min-width: 0;
+                font-size: 14px;
+            }
+
+            #statsSecCharts .card-body {
+                overflow: hidden;
+            }
+
+            #statsSecHistory .card-header {
+                align-items: flex-start !important;
+                flex-direction: column;
+                gap: 8px;
+            }
+
+            #statsSecHistory .card-header > .d-flex {
+                flex-wrap: wrap;
+            }
+
+            #statsSecHistory .card-body,
+            #statsSecSchema .card-body {
+                overflow-x: auto;
+            }
+        }
+
+        .query-history-question.is-clamped {
+            display: -webkit-box;
+            -webkit-box-orient: vertical;
+            -webkit-line-clamp: 2;
+            overflow: hidden;
+        }
+
+        .query-history-sql-wrap {
+            position: relative;
+            padding-right: 58px;
+        }
+
+        .query-history-sql {
+            display: block;
+            max-height: 4.2em;
+            margin: 0;
+            overflow: hidden;
+            color: #c7254e;
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
+            border-radius: 4px;
+            padding: 5px 7px;
+            font-size: 11px;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }
+
+        .query-history-sql.is-expanded {
+            max-height: none;
+            overflow: visible;
+        }
+
+        .query-history-truncated {
+            margin-top: 3px;
+            color: #b45309;
+            font-size: 11px;
+            line-height: 1.3;
+        }
+
+        .query-history-actions {
+            position: absolute;
+            top: 0;
+            right: 0;
+            display: flex;
+            gap: 2px;
+        }
+
+        .query-history-action {
+            width: 26px;
+            height: 26px;
+            padding: 0;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .query-history-copy-notice {
+            position: fixed;
+            left: 50%;
+            bottom: 24px;
+            z-index: 2000;
+            transform: translate(-50%, 16px);
+            max-width: min(520px, calc(100vw - 32px));
+            padding: 9px 14px;
+            border-radius: 6px;
+            color: #fff;
+            background: #166534;
+            box-shadow: 0 8px 24px rgba(15, 23, 42, 0.2);
+            font-size: 13px;
+            line-height: 1.4;
+            opacity: 0;
+            pointer-events: none;
+            transition: opacity 0.15s ease, transform 0.15s ease;
+        }
+
+        .query-history-copy-notice.is-visible {
+            opacity: 1;
+            transform: translate(-50%, 0);
+        }
+
+        .query-history-copy-notice.is-error {
+            background: #9a3412;
         }
 
         /* 分享报告收藏（localStorage，刷新不丢） */
@@ -1447,9 +1607,9 @@
 <body>
     <div class="container">
         <div class="header">
-            <h1>Schemist <small style="font-size:0.5em;color:#888;">Schema-Guided SQL Assistant</small></h1>
+            <h1>Schemist <small style="font-size:0.5em;color:#888;">V2</small></h1>
             <div class="d-flex align-items-center flex-wrap gap-2">
-                <p class="mb-0">基于本地 Schema 知识库（hivebrain）：自然语言生成 SQL → 校验 → Spark / Trino 执行 → 分析与可视化。</p>
+                <p class="mb-0">输入自然语言查询，AI将为您生成高质量SQL，并支持数据可视化，基于你配置的数据仓库元数据</p>
                 <div class="engine-switcher" id="engineSwitcher">
                     <button class="engine-btn spark-active active" id="engineSparkBtn" data-engine="spark">⚡ Spark
                         SQL</button>
@@ -1854,19 +2014,19 @@
                     <div class="card-body">
                         <div class="faq-item">
                             <div class="faq-question">如何提高SQL生成质量?</div>
-                            <div class="faq-answer">提供清晰、具体的业务需求描述（目标、时间范围、筛选条件等），并结合已索引的库表与分区习惯进行问询。</div>
+                            <div class="faq-answer">提供清晰、具体的业务需求描述，包括目标、时间范围、筛选条件等关键信息，结合已配置的数据仓库表名进行问询。</div>
                         </div>
                         <div class="faq-item">
                             <div class="faq-question">为什么有时生成的SQL不准确?</div>
-                            <div class="faq-answer">SQL 生成依赖本地载入的 JSON Schema（如 hivebrain）；元数据不完整或需求模糊时可能影响准确性。</div>
+                            <div class="faq-answer">SQL生成基于已配置的数据仓库的表结构信息，如果表结构不完整或需求描述不清晰，可能会影响结果准确性。</div>
                         </div>
                         <div class="faq-item">
                             <div class="faq-question">如何查看数据可视化效果?</div>
                             <div class="faq-answer">执行SQL查询后，点击"可视化数据"按钮，选择适合的图表类型和数据列，即可生成数据可视化图表。</div>
                         </div>
                         <div class="faq-item">
-                            <div class="faq-question">如何获取帮助?</div>
-                            <div class="faq-answer">开源版本请参阅仓库 README / Issue；企业内部部署请咨询平台管理员。</div>
+                            <div class="faq-question">如何联系开发者?</div>
+                            <div class="faq-answer">如有问题或建议，请通过 Schemist 项目的 Issue 反馈。</div>
                         </div>
                     </div>
                 </div>
@@ -1969,7 +2129,7 @@
                 <div class="tab-content">
                     <!-- 历史记录 -->
                     <div class="tab-pane fade show active" id="tabHistory">
-                        <div class="d-flex gap-1 my-2">
+                        <div class="d-flex flex-wrap gap-1 my-2">
                             <select class="form-select form-select-sm" style="width:auto;font-size:12px;"
                                 id="filterEngine" onchange="refreshStats()">
                                 <option value="">全部引擎</option>
@@ -1982,6 +2142,18 @@
                                 <option value="generate">SQL生成</option>
                                 <option value="execute">SQL执行</option>
                             </select>
+                            <select class="form-select form-select-sm" style="width:auto;font-size:12px;"
+                                id="filterSource" onchange="refreshStats()">
+                                <option value="">全部来源</option>
+                                <option value="mcp">MCP</option>
+                                <option value="web">Web</option>
+                                <option value="feishu">飞书</option>
+                                <option value="api">API</option>
+                            </select>
+                            <input class="form-control form-control-sm" style="width:145px;font-size:12px;"
+                                id="filterClientIp" type="search" placeholder="客户端 IP" title="按客户端 IP 精确筛选"
+                                onchange="refreshStats()"
+                                onkeydown="if(event.key==='Enter'){event.preventDefault();refreshStats();}">
                         </div>
                         <div style="max-height:340px;overflow-y:auto;">
                             <table class="table table-sm table-hover mb-0" style="font-size:12px;">
@@ -2182,7 +2354,7 @@
                         <div class="card-header bg-white border-0 d-flex justify-content-between align-items-center">
                             <span class="fw-bold" style="font-size:14px;"><i
                                     class="bi bi-clock-history me-1"></i>完整查询历史</span>
-                            <div class="d-flex gap-2">
+                            <div class="d-flex flex-wrap gap-2 justify-content-end">
                                 <select class="form-select form-select-sm" style="width:auto;" id="fFilterEngine"
                                     onchange="refreshStatsFullscreen()">
                                     <option value="">全部引擎</option>
@@ -2195,6 +2367,18 @@
                                     <option value="generate">SQL生成</option>
                                     <option value="execute">SQL执行</option>
                                 </select>
+                                <select class="form-select form-select-sm" style="width:auto;" id="fFilterSource"
+                                    onchange="refreshStatsFullscreen()">
+                                    <option value="">全部来源</option>
+                                    <option value="mcp">MCP</option>
+                                    <option value="web">Web</option>
+                                    <option value="feishu">飞书</option>
+                                    <option value="api">API</option>
+                                </select>
+                                <input class="form-control form-control-sm" style="width:160px;" id="fFilterClientIp"
+                                    type="search" placeholder="客户端 IP" title="按客户端 IP 精确筛选"
+                                    onchange="refreshStatsFullscreen()"
+                                    onkeydown="if(event.key==='Enter'){event.preventDefault();refreshStatsFullscreen();}">
                             </div>
                         </div>
                         <div class="card-body p-0" style="max-height:400px;overflow-y:auto;">
@@ -2418,8 +2602,8 @@
     <!-- 添加页脚 -->
     <footer class="mt-5 py-3 text-center text-muted" style="border-top: 1px solid #eee; background-color: #f9f9f9;">
         <div class="container">
-            <p class="mb-1">© Schemist — Schema-Guided SQL Assistant</p>
-            <p class="mb-0"><small>DeepAgent + Skills · Spark SQL + Trino · 本地 Schema（hivebrain）</small></p>
+            <p class="mb-1">© 2023-2026 Schemist V2</p>
+            <p class="mb-0"><small>Schemist contributors | DeepAgent + Skills 架构 | 双引擎: Spark SQL + Trino</small></p>
         </div>
     </footer>
 
@@ -2433,10 +2617,26 @@
         const QUERY_RESULT_MAX_ROWS = Number('{{ query_result_max_rows|default(2000) }}') || 2000;
         const PAGE_AGENT_BASE_URL = {{ page_agent_base_url|default ('') | tojson }};
         const PAGE_AGENT_API_KEY = {{ page_agent_api_key|default ('') | tojson }};
-        const PAGE_AGENT_MODEL = {{ page_agent_model|default ('ws/kimi-k2.6') | tojson }};
+        const PAGE_AGENT_MODEL = {{ page_agent_model|default ('gpt-4o-mini') | tojson }};
 
         // 当前SQL引擎: "spark" 或 "trino"
         let currentSqlEngine = 'spark';
+        var SQL_ENGINE_STORAGE_KEY = 'sqlaiv2.engine';
+
+        function readPersistedSqlEngine() {
+            try {
+                var v = (localStorage.getItem(SQL_ENGINE_STORAGE_KEY) || '').trim();
+                return (v === 'spark' || v === 'trino') ? v : '';
+            } catch (e) { return ''; }
+        }
+
+        function persistSqlEngine(engine) {
+            try {
+                if (engine === 'spark' || engine === 'trino') {
+                    localStorage.setItem(SQL_ENGINE_STORAGE_KEY, engine);
+                }
+            } catch (e) { /* ignore */ }
+        }
         // Web 端全流程 trace：一次“生成 -> 执行 -> 分析”复用同一 X-Request-ID
         let currentFlowTraceId = '';
 
@@ -2470,8 +2670,8 @@
         }
 
         // ======================== Web 会话快照（刷新恢复） ========================
-        var LS_WEB_SESSION_ID = 'schemist_web_session_id';
-        var SS_WEB_SESSION_SNAPSHOT = 'schemist_web_session_snapshot';
+        var LS_WEB_SESSION_ID = 'sql_ai_web_session_id';
+        var SS_WEB_SESSION_SNAPSHOT = 'sql_ai_web_session_snapshot';
         var CLIENT_SNAPSHOT_MAX_ROWS = 400;
         var webSessionSaveTimer = null;
         var webSessionRestoreDone = false;
@@ -2578,6 +2778,8 @@
             if (!phase) return false;
             return (
                 phase === 'api.analyze_data.exit' ||
+                phase === 'api.run_pipeline.exit' ||
+                phase === 'api.run_pipeline.exception' ||
                 phase === 'feishu.pipeline.done' ||
                 phase === 'feishu.pipeline.exception' ||
                 phase === 'api.generate_sql.exception' ||
@@ -2668,14 +2870,22 @@
                 });
             };
             var sqlOnly = has(/^feishu\.pipeline\.branch$/);
-            var genDone = has(/^api\.generate_sql\.exit$/) || has(/^feishu\.phase\.generate_sql\.done$/);
-            var genRun = has(/^api\.generate_sql\.enter$/) || has(/^feishu\.phase\.generate_sql\.start$/) || has(/^agent\.generate_sql\.done$/);
+            var genDone = has(/^api\.generate_sql\.exit$/) || has(/^feishu\.phase\.generate_sql\.done$/) ||
+                has(/^pipeline\.generate\.done$/) || has(/^pipeline\.generate\.skip$/) || has(/^agent\.generate_sql\.done$/);
+            var genRun = (has(/^api\.generate_sql\.enter$/) || has(/^feishu\.phase\.generate_sql\.start$/) ||
+                has(/^pipeline\.generate\.start$/) || has(/^agent\.generate_sql\.start$/)) && !genDone;
             var genErr = has(/^api\.generate_sql\.exception$/) || has(/feishu\.phase\.generate_sql\.fail$/);
-            var exDone = has(/^api\.execute_sql\.exit$/) || has(/^feishu\.phase\.execute_sql\.done$/);
-            var exRun = has(/^api\.execute_sql\.enter$/) || has(/^feishu\.phase\.execute_sql\.start$/) || has(/^agent\.execute_sql\.(enter|done)$/);
-            var exErr = has(/^api\.execute_sql\.exception$/) || has(/feishu\.phase\.execute_sql\.fail$/);
-            var anDone = has(/^api\.analyze_data\.exit$/) || has(/^feishu\.phase\.analyze\.done$/);
-            var anRun = has(/^api\.analyze_data\.enter$/) || has(/^feishu\.phase\.analyze\.start$/) || has(/^agent\.analyze_data\.(enter|done)$/);
+            var exDone = has(/^api\.execute_sql\.exit$/) || has(/^feishu\.phase\.execute_sql\.done$/) ||
+                has(/^pipeline\.execute\.done$/) || has(/^agent\.execute_sql\.done$/);
+            var exRun = has(/^api\.execute_sql\.enter$/) || has(/^feishu\.phase\.execute_sql\.start$/) ||
+                has(/^pipeline\.execute\.start$/) || has(/^agent\.execute_sql\.enter$/) ||
+                (has(/^pipeline\.repair\.done$/) && !exDone);
+            var exErr = has(/^api\.execute_sql\.exception$/) || has(/feishu\.phase\.execute_sql\.fail$/) ||
+                has(/^pipeline\.execute\.fail$/);
+            var anDone = has(/^api\.analyze_data\.exit$/) || has(/^feishu\.phase\.analyze\.done$/) ||
+                has(/^pipeline\.analyze\.done$/);
+            var anRun = has(/^api\.analyze_data\.enter$/) || has(/^feishu\.phase\.analyze\.start$/) ||
+                has(/^pipeline\.analyze\.start$/);
             var anErr = has(/^api\.analyze_data\.exception$/) || has(/feishu\.phase\.analyze\.fail$/);
             var shDone = has(/^share\.persist\.done$/) || has(/feishu\.phase\.share$/);
             function state(done, run, err, skip) {
@@ -2926,15 +3136,31 @@
             }
         }
 
+        function buildQueryHistoryUrl(engineSelectId, typeSelectId, sourceSelectId, clientIpInputId, limit) {
+            const params = ['limit=' + encodeURIComponent(limit)];
+            const engine = document.getElementById(engineSelectId)?.value || '';
+            const queryType = document.getElementById(typeSelectId)?.value || '';
+            const source = document.getElementById(sourceSelectId)?.value || '';
+            const clientIp = document.getElementById(clientIpInputId)?.value?.trim() || '';
+            if (engine) params.push('engine=' + encodeURIComponent(engine));
+            if (queryType) params.push('query_type=' + encodeURIComponent(queryType));
+            if (source) params.push('source=' + encodeURIComponent(source));
+            if (clientIp) params.push('client_ip=' + encodeURIComponent(clientIp));
+            return apiUrl('/api/query-history?' + params.join('&'));
+        }
+
         async function refreshStats() {
             try {
-                const [statsResp, feedbackResp] = await Promise.all([
+                const [statsResp, feedbackResp, historyResp] = await Promise.all([
                     fetch(apiUrl('/api/query-stats')),
                     fetch(apiUrl('/api/schema-feedback-stats?limit=20')),
+                    fetch(buildQueryHistoryUrl('filterEngine', 'filterType', 'filterSource', 'filterClientIp', 50)),
                 ]);
                 if (!statsResp.ok) return;
                 const data = await statsResp.json();
                 const feedback = feedbackResp.ok ? await feedbackResp.json() : null;
+                const history = historyResp.ok ? await historyResp.json() : null;
+                if (history && Array.isArray(history.items)) data.recent_queries = history.items;
                 schemaFeedbackSnapshot = feedback;
                 renderStats(data);
                 renderSchemaFeedback(feedback);
@@ -3033,17 +3259,22 @@
 
             const filterEngine = document.getElementById('filterEngine')?.value || '';
             const filterType = document.getElementById('filterType')?.value || '';
+            const filterSource = document.getElementById('filterSource')?.value || '';
+            const filterClientIp = document.getElementById('filterClientIp')?.value?.trim() || '';
 
             let filtered = items;
             if (filterEngine) filtered = filtered.filter(function (h) { return h.engine === filterEngine; });
             if (filterType) filtered = filtered.filter(function (h) { return h.type === filterType; });
+            if (filterSource) filtered = filtered.filter(function (h) { return h.source === filterSource; });
+            if (filterClientIp) filtered = filtered.filter(function (h) { return h.client_ip === filterClientIp; });
 
             if (!filtered.length) {
                 tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-3">暂无匹配记录</td></tr>';
                 return;
             }
 
-            tbody.innerHTML = filtered.slice(0, 50).map(function (h) {
+            const visible = filtered.slice(0, 50);
+            tbody.innerHTML = visible.map(function (h) {
                 const typeBadge = h.type === 'generate'
                     ? '<span class="badge bg-info" style="font-size:10px">生成</span>'
                     : '<span class="badge bg-warning text-dark" style="font-size:10px">执行</span>';
@@ -3052,9 +3283,7 @@
                     : '<span class="badge bg-primary" style="font-size:10px">Trino</span>';
                 const statusIcon = h.success ? '✓' : '✗';
                 const statusClass = h.success ? 'text-success' : 'text-danger';
-                const content = h.question
-                    ? '<span title="' + (h.question || '').replace(/"/g, '&quot;') + '">' + (h.question || '').substring(0, 30) + '</span>'
-                    : '<code title="' + (h.sql || '').replace(/"/g, '&quot;') + '">' + (h.sql || '').substring(0, 35) + '</code>';
+                const content = renderQueryHistoryContent(h, true);
                 const duration = h.duration > 0 ? h.duration + 's' : '-';
                 const timeShort = (h.timestamp || '').substring(5);
 
@@ -3067,6 +3296,199 @@
                     '<td>' + duration + '</td>' +
                     '</tr>';
             }).join('');
+            bindQueryHistoryActions(tbody);
+        }
+
+        function escapeQueryHistoryHtml(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        function renderQueryHistoryContent(item, compact) {
+            const question = String(item.question || '').trim();
+            const sql = String(item.sql || '').trim();
+            const legacyTruncated = !Object.prototype.hasOwnProperty.call(item, 'sql_truncated') && sql.length === 500;
+            let html = '<div class="query-history-content">';
+            html += renderQueryHistoryContext(item);
+            if (question) {
+                html += '<div class="query-history-question' + (compact ? ' is-clamped' : '') + '">' +
+                    escapeQueryHistoryHtml(question) + '</div>';
+            }
+            if (sql) {
+                html += '<div class="query-history-sql-wrap">' +
+                    '<pre class="query-history-sql">' + escapeQueryHistoryHtml(sql) + '</pre>' +
+                    '<div class="query-history-actions">' +
+                    '<button type="button" class="btn btn-sm btn-outline-secondary query-history-action" ' +
+                    'data-history-action="toggle" title="展开当前行 SQL" aria-label="展开当前行 SQL">' +
+                    '<i class="bi bi-chevron-down"></i></button>' +
+                    '<button type="button" class="btn btn-sm btn-outline-secondary query-history-action" ' +
+                    'data-history-action="copy" title="复制当前行 SQL" aria-label="复制当前行 SQL">' +
+                    '<i class="bi bi-clipboard"></i></button>' +
+                    '</div></div>';
+                if (legacyTruncated) {
+                    html += '<div class="query-history-truncated"><i class="bi bi-exclamation-triangle me-1"></i>' +
+                        '旧记录仅保存了前 500 个字符，无法恢复后半段</div>';
+                }
+            }
+            if (!question && !sql) {
+                html += '<span class="text-muted">-</span>';
+            }
+            return html + '</div>';
+        }
+
+        function renderQueryHistoryContext(item) {
+            const source = String(item.source || '').toLowerCase();
+            const traceId = String(item.trace_id || '');
+            const questionId = String(item.question_id || '');
+            const queryId = String(item.query_id || '');
+            const clientIp = String(item.client_ip || '');
+            const clientAgent = String(item.client_agent || '');
+            if (!source && !traceId && !questionId && !queryId && !clientIp) return '';
+            const sourceLabels = { mcp: 'MCP', web: 'Web', feishu: '飞书', api: 'API' };
+            let html = '<div class="query-history-context">';
+            if (source) {
+                html += '<span class="query-history-source source-' + escapeQueryHistoryHtml(source) + '">' +
+                    escapeQueryHistoryHtml(sourceLabels[source] || source.toUpperCase()) + '</span>';
+            }
+            if (clientIp) {
+                const ipTitle = source === 'feishu'
+                    ? '飞书网关回调 IP，不代表飞书用户本人'
+                    : '客户端请求 IP';
+                const agentTitle = clientAgent ? '；客户端：' + clientAgent : '';
+                html += '<span title="' + escapeQueryHistoryHtml(ipTitle + agentTitle) + '">' +
+                    '<i class="bi bi-hdd-network me-1"></i>IP <code>' +
+                    escapeQueryHistoryHtml(clientIp) + '</code></span>';
+            }
+            if (questionId) {
+                html += '<span title="同一问题编号会关联多条验证 SQL">问题 <code>' +
+                    escapeQueryHistoryHtml(questionId) + '</code></span>';
+            }
+            if (traceId) {
+                html += '<span title="本次工具调用追踪号">追踪 <code>' +
+                    escapeQueryHistoryHtml(traceId) + '</code></span>';
+            }
+            if (queryId) {
+                html += '<span title="数据库查询号：' + escapeQueryHistoryHtml(queryId) + '">查询 <code>' +
+                    escapeQueryHistoryHtml(queryId.substring(0, 12)) + '</code></span>';
+            }
+            return html + '</div>';
+        }
+
+        let queryHistoryCopyNoticeTimer = null;
+
+        function showQueryHistoryCopyNotice(message, isError) {
+            let notice = document.getElementById('queryHistoryCopyNotice');
+            if (!notice) {
+                notice = document.createElement('div');
+                notice.id = 'queryHistoryCopyNotice';
+                notice.className = 'query-history-copy-notice';
+                notice.setAttribute('role', 'status');
+                notice.setAttribute('aria-live', 'polite');
+                document.body.appendChild(notice);
+            }
+            notice.textContent = message;
+            notice.classList.toggle('is-error', !!isError);
+            notice.classList.add('is-visible');
+            if (queryHistoryCopyNoticeTimer) window.clearTimeout(queryHistoryCopyNoticeTimer);
+            queryHistoryCopyNoticeTimer = window.setTimeout(function () {
+                notice.classList.remove('is-visible');
+            }, isError ? 4200 : 1800);
+        }
+
+        function copyQueryHistorySql(text, button, code) {
+            const markCopied = function () {
+                const icon = button.querySelector('i');
+                if (icon) icon.className = 'bi bi-check-lg text-success';
+                button.title = '已复制';
+                button.setAttribute('aria-label', '已复制当前行 SQL');
+                showQueryHistoryCopyNotice('已复制当前行 SQL（' + text.length + ' 个字符）', false);
+                window.setTimeout(function () {
+                    if (icon) icon.className = 'bi bi-clipboard';
+                    button.title = '复制当前行 SQL';
+                    button.setAttribute('aria-label', button.title);
+                }, 1200);
+            };
+
+            // The production page currently uses HTTP, where Clipboard API is normally unavailable.
+            // Run the legacy copy synchronously while the click still has user activation.
+            if (fallbackCopyQueryHistorySql(text, button)) {
+                markCopied();
+                return;
+            }
+            if (window.isSecureContext && navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(markCopied).catch(function () {
+                    selectQueryHistorySqlForManualCopy(code, button);
+                });
+                return;
+            }
+            selectQueryHistorySqlForManualCopy(code, button);
+        }
+
+        function fallbackCopyQueryHistorySql(text, returnFocusTo) {
+            const area = document.createElement('textarea');
+            area.value = text;
+            area.style.position = 'fixed';
+            area.style.left = '-9999px';
+            area.style.top = '0';
+            area.style.width = '2px';
+            area.style.height = '2px';
+            // Keep the temporary input inside an open Bootstrap focus trap.
+            // Appending it to body makes a fullscreen modal immediately steal focus back.
+            const copyHost = returnFocusTo.closest('.modal.show, .offcanvas.show') || document.body;
+            copyHost.appendChild(area);
+            area.focus({ preventScroll: true });
+            area.select();
+            area.setSelectionRange(0, area.value.length);
+            let copied = false;
+            try {
+                copied = !!document.execCommand('copy');
+            } catch (e) {
+                copied = false;
+            } finally {
+                area.remove();
+                if (returnFocusTo && returnFocusTo.focus) returnFocusTo.focus({ preventScroll: true });
+            }
+            return copied;
+        }
+
+        function selectQueryHistorySqlForManualCopy(code, button) {
+            if (code) {
+                code.classList.add('is-expanded');
+                const range = document.createRange();
+                range.selectNodeContents(code);
+                const selection = window.getSelection();
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }
+            const icon = button.querySelector('i');
+            if (icon) icon.className = 'bi bi-exclamation-triangle text-warning';
+            button.title = '浏览器阻止了自动复制';
+            button.setAttribute('aria-label', button.title);
+            showQueryHistoryCopyNotice('浏览器阻止了自动复制，已选中当前行 SQL，请按 Ctrl+C', true);
+        }
+
+        function bindQueryHistoryActions(tbody) {
+            tbody.onclick = function (event) {
+                const button = event.target.closest('[data-history-action]');
+                if (!button || !tbody.contains(button)) return;
+                event.preventDefault();
+                event.stopPropagation();
+                const code = button.closest('.query-history-sql-wrap')?.querySelector('.query-history-sql');
+                if (!code) return;
+                if (button.dataset.historyAction === 'copy') {
+                    copyQueryHistorySql(code.textContent || '', button, code);
+                    return;
+                }
+                const expanded = code.classList.toggle('is-expanded');
+                const icon = button.querySelector('i');
+                if (icon) icon.className = expanded ? 'bi bi-chevron-up' : 'bi bi-chevron-down';
+                button.title = expanded ? '收起 SQL' : '展开完整 SQL';
+                button.setAttribute('aria-label', button.title);
+            };
         }
 
         function renderSchemaFeedback(data) {
@@ -3112,13 +3534,16 @@
 
         async function refreshStatsFullscreen() {
             try {
-                const [statsResp, feedbackResp] = await Promise.all([
+                const [statsResp, feedbackResp, historyResp] = await Promise.all([
                     fetch(apiUrl('/api/query-stats')),
                     fetch(apiUrl('/api/schema-feedback-stats?limit=20')),
+                    fetch(buildQueryHistoryUrl('fFilterEngine', 'fFilterType', 'fFilterSource', 'fFilterClientIp', 100)),
                 ]);
                 if (!statsResp.ok) return;
                 const data = await statsResp.json();
                 const feedback = feedbackResp.ok ? await feedbackResp.json() : null;
+                const history = historyResp.ok ? await historyResp.json() : null;
+                if (history && Array.isArray(history.items)) data.recent_queries = history.items;
                 schemaFeedbackSnapshot = feedback;
                 _lastStatsData = data;
                 renderStatsFullscreen(data);
@@ -3241,16 +3666,21 @@
 
             const filterEngine = document.getElementById('fFilterEngine')?.value || '';
             const filterType = document.getElementById('fFilterType')?.value || '';
+            const filterSource = document.getElementById('fFilterSource')?.value || '';
+            const filterClientIp = document.getElementById('fFilterClientIp')?.value?.trim() || '';
             let filtered = items;
             if (filterEngine) filtered = filtered.filter(function (h) { return h.engine === filterEngine; });
             if (filterType) filtered = filtered.filter(function (h) { return h.type === filterType; });
+            if (filterSource) filtered = filtered.filter(function (h) { return h.source === filterSource; });
+            if (filterClientIp) filtered = filtered.filter(function (h) { return h.client_ip === filterClientIp; });
 
             if (!filtered.length) {
                 tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted py-3">暂无匹配记录</td></tr>';
                 return;
             }
 
-            tbody.innerHTML = filtered.slice(0, 100).map(function (h) {
+            const visible = filtered.slice(0, 100);
+            tbody.innerHTML = visible.map(function (h) {
                 const typeBadge = h.type === 'generate'
                     ? '<span class="badge bg-info">生成</span>'
                     : '<span class="badge bg-warning text-dark">执行</span>';
@@ -3258,9 +3688,7 @@
                     ? '<span class="badge" style="background:#ff6b35">Spark</span>'
                     : '<span class="badge bg-primary">Trino</span>';
                 const statusIcon = h.success ? '<span class="text-success fw-bold">✓</span>' : '<span class="text-danger fw-bold">✗</span>';
-                const content = h.question
-                    ? '<span title="' + (h.question || '').replace(/"/g, '&quot;') + '">' + (h.question || '').substring(0, 60) + '</span>'
-                    : '<code title="' + (h.sql || '').replace(/"/g, '&quot;') + '">' + (h.sql || '').substring(0, 60) + '</code>';
+                const content = renderQueryHistoryContent(h, false);
                 const duration = h.duration > 0 ? h.duration + 's' : '-';
                 const rowCount = h.row_count || '-';
                 return '<tr class="ps-3"><td class="ps-3 text-muted">' + (h.timestamp || '') + '</td>' +
@@ -3268,6 +3696,7 @@
                     '<td>' + content + '</td><td>' + statusIcon + '</td>' +
                     '<td>' + duration + '</td><td>' + rowCount + '</td></tr>';
             }).join('');
+            bindQueryHistoryActions(tbody);
         }
 
         function renderFullscreenSchemaFeedback(data) {
@@ -3926,19 +4355,21 @@
 
         // 引擎切换逻辑
         function switchEngine(engine) {
+            if (engine !== 'spark' && engine !== 'trino') return;
             currentSqlEngine = engine;
+            persistSqlEngine(engine);
             const sparkBtn = document.getElementById('engineSparkBtn');
             const trinoBtn = document.getElementById('engineTrinoBtn');
             const indicator = document.getElementById('engineIndicator');
 
             if (engine === 'spark') {
-                sparkBtn.classList.add('active', 'spark-active');
-                trinoBtn.classList.remove('active', 'trino-active');
-                indicator.innerHTML = '<span class="engine-dot spark"></span>当前引擎: Spark SQL';
+                if (sparkBtn) sparkBtn.classList.add('active', 'spark-active');
+                if (trinoBtn) trinoBtn.classList.remove('active', 'trino-active');
+                if (indicator) indicator.innerHTML = '<span class="engine-dot spark"></span>当前引擎: Spark SQL';
             } else {
-                trinoBtn.classList.add('active', 'trino-active');
-                sparkBtn.classList.remove('active', 'spark-active');
-                indicator.innerHTML = '<span class="engine-dot trino"></span>当前引擎: Trino';
+                if (trinoBtn) trinoBtn.classList.add('active', 'trino-active');
+                if (sparkBtn) sparkBtn.classList.remove('active', 'spark-active');
+                if (indicator) indicator.innerHTML = '<span class="engine-dot trino"></span>当前引擎: Trino';
             }
             console.log('SQL引擎已切换为:', engine);
         }
@@ -4023,7 +4454,7 @@
             try {
                 if (window.PageAgent && PAGE_AGENT_BASE_URL && PAGE_AGENT_API_KEY) {
                     window.__pageAgent = new window.PageAgent({
-                        model: PAGE_AGENT_MODEL || 'ws/kimi-k2.6',
+                        model: PAGE_AGENT_MODEL || 'gpt-4o-mini',
                         baseURL: PAGE_AGENT_BASE_URL,
                         apiKey: PAGE_AGENT_API_KEY,
                         language: 'zh-CN'
@@ -4060,9 +4491,11 @@
                 if (b) b.textContent = d.total_queries || 0;
             }).catch(function () { });
 
-            // 绑定引擎切换按钮
+            // 绑定引擎切换按钮（优先恢复上次选择的引擎，避免 UI 显示 Spark 但实际走 Trino）
             document.getElementById('engineSparkBtn').addEventListener('click', function () { switchEngine('spark'); });
             document.getElementById('engineTrinoBtn').addEventListener('click', function () { switchEngine('trino'); });
+            var persistedEngine = readPersistedSqlEngine();
+            if (persistedEngine) switchEngine(persistedEngine);
 
             // 加载并绑定 LLM 模型下拉框
             loadLlmModels();
@@ -4482,6 +4915,12 @@
 
             // 智能模式标志
             let isSmartModeRunning = false;
+            let isSqlFormSubmitting = false;
+            let smartModePipelinePollTimer = null;
+            let smartModePipelinePollFetchedExecId = '';
+            let smartModeLastSnapSql = '';
+            let smartModeLastSnapQueryId = '';
+            let smartModeLastSnapReportKey = '';
 
             // ==================== 智能模式自动执行流程 ====================
 
@@ -4489,6 +4928,207 @@
             let smartModeStartTime = 0;
             let smartModeStepTimes = [0, 0, 0, 0]; // 每个步骤的耗时（秒）
             let smartModeStepStartTime = 0;
+
+            function stopSmartModePipelinePoll() {
+                if (smartModePipelinePollTimer) {
+                    clearInterval(smartModePipelinePollTimer);
+                    smartModePipelinePollTimer = null;
+                }
+            }
+
+            function startSmartModePipelinePoll(flowTid) {
+                stopSmartModePipelinePoll();
+                smartModePipelinePollFetchedExecId = '';
+                smartModeLastSnapSql = '';
+                smartModeLastSnapQueryId = '';
+                smartModeLastSnapReportKey = '';
+                if (!flowTid) return;
+                var pollOnce = function () {
+                    fetch(apiUrl('/api/pipeline-trace/' + encodeURIComponent(flowTid)))
+                        .then(function (r) { return r.ok ? r.json() : null; })
+                        .then(function (j) {
+                            if (!j) return;
+                            syncSmartModeUIFromTrace(j, flowTid);
+                        })
+                        .catch(function () { });
+                };
+                pollOnce();
+                smartModePipelinePollTimer = setInterval(pollOnce, 600);
+            }
+
+            function syncSmartModeUIFromTrace(traceResp, flowTid) {
+                if (!isSmartModeRunning || !traceResp) return;
+                var snap = traceResp.snapshot || {};
+                var events = traceResp.events || [];
+
+                // 先应用 snapshot（终态优先），再更新进度文案，避免 analyze.start 把 loading 盖回去
+                if (snap && snap.stage) {
+                    if (snap.sql && snap.sql !== smartModeLastSnapSql) {
+                        smartModeLastSnapSql = snap.sql;
+                        applyGenerateDataToUI({
+                            sql: snap.sql,
+                            explanation: snap.explanation || '',
+                            tables_used: snap.tables_used || [],
+                            execution_plan: snap.execution_plan || null,
+                            generate_time: snap.generate_time || 0,
+                            query_time: snap.generate_time || 0
+                        });
+                        if (snap.stage === 'generate_done' || snap.stage === 'repaired') {
+                            if (snap.generate_time && smartModeStepTimes[0] <= 0) {
+                                smartModeStepTimes[0] = snap.generate_time;
+                            }
+                            if (snap.stage === 'generate_done') {
+                                showSmartModeStatus(1, '📝 Step 1 完成' +
+                                    (snap.generate_time ? ' (' + Number(snap.generate_time).toFixed(1) + 's)' : '') +
+                                    '，正在执行查询...');
+                            }
+                        }
+                    }
+
+                    var qid = (snap.query_id || '').trim();
+                    if (qid && qid !== smartModeLastSnapQueryId &&
+                        (snap.stage === 'execute_done' || snap.stage === 'analyze_running' ||
+                            snap.stage === 'analyze_done' || snap.stage === 'done')) {
+                        smartModeLastSnapQueryId = qid;
+                        fetchQueryResultById(qid).then(function (qr) {
+                            if (!qr) return;
+                            applyExecutionDataToUI({
+                                success: true,
+                                result: qr.result || [],
+                                headers: qr.headers || [],
+                                row_count: qr.row_count,
+                                execution_time: qr.execution_time,
+                                query_id: qid,
+                                debug_info: {}
+                            }, snap.sql || smartModeLastSnapSql || '');
+                            if (snap.execution_time && smartModeStepTimes[1] <= 0) {
+                                smartModeStepTimes[1] = snap.execution_time;
+                            }
+                        });
+                    }
+
+                    if (snap.report && (snap.stage === 'analyze_done' || snap.stage === 'done')) {
+                        var rptKey = snap.stage + ':' + snap.report.length;
+                        if (rptKey !== smartModeLastSnapReportKey) {
+                            smartModeLastSnapReportKey = rptKey;
+                            applyAnalysisDataToUI({
+                                success: true,
+                                report: snap.report,
+                                analysis_time: snap.analysis_time || 0
+                            });
+                            if (snap.analysis_time) smartModeStepTimes[3] = snap.analysis_time;
+                        }
+                    } else if (snap.stage === 'analyze_done' || snap.stage === 'done' || snap.stage === 'failed') {
+                        showSmartModeReportLoading(false);
+                        if (snap.stage === 'failed' && snap.error_kind === 'permission_denied' && snap.error) {
+                            showSqlPermissionDeniedAlert(snap.error);
+                            showSmartModeStatus(1, '🔒 权限不足: 请为执行账号申请 SELECT 权限', true);
+                        }
+                    }
+                }
+
+                syncSmartModeUIFromPipelineEvents(events, flowTid, snap);
+                updatePipelineTracePanel(events);
+            }
+
+            function syncSmartModeUIFromPipelineEvents(events, flowTid, snap) {
+                if (!isSmartModeRunning || !events || !events.length) return;
+                snap = snap || {};
+                var analyzeDone = snap.stage === 'analyze_done' || snap.stage === 'done';
+                var has = function (re) {
+                    return events.some(function (e) { return re.test(e.phase || ''); });
+                };
+                var findLast = function (re) {
+                    for (var i = events.length - 1; i >= 0; i--) {
+                        if (re.test(events[i].phase || '')) return events[i];
+                    }
+                    return null;
+                };
+
+                if (has(/^agent\.repair_sql\.start$/) || has(/^pipeline\.precheck\.fail$/)) {
+                    showSmartModeStatus(1, '🔧 正在自动修复 SQL...');
+                }
+                if (has(/^pipeline\.repair\.done$/)) {
+                    var repairEv = findLast(/^pipeline\.repair\.done$/);
+                    var reason = repairEv && repairEv.payload ? (repairEv.payload.reason || '') : '';
+                    showSmartModeStatus(1, '🔧 SQL 已修复' + (reason ? '（' + reason + '）' : '') + '，正在重新执行...');
+                }
+                if (has(/^pipeline\.execute\.start$/) || has(/^agent\.execute_sql\.enter$/)) {
+                    if (!has(/^pipeline\.analyze\.start$/)) {
+                        showSmartModeStatus(1, '⚡ 正在执行 SQL 查询...');
+                    }
+                }
+                if (has(/^pipeline\.execute\.permission_denied$/)) {
+                    showSmartModeStatus(1, '🔒 权限不足: 请为执行账号申请 SELECT 权限', true);
+                    if (snap.error) showSqlPermissionDeniedAlert(snap.error);
+                }
+
+                var exEv = findLast(/^pipeline\.execute\.done$/) || findLast(/^agent\.execute_sql\.done$/);
+                if (exEv) {
+                    var pl = exEv.payload || {};
+                    var ok = pl.ok === 1 || pl.ok === true;
+                    var rows = pl.rows != null ? pl.rows : 0;
+                    var sec = pl.sec != null ? Number(pl.sec).toFixed(1) : '';
+                    if (ok && !has(/^pipeline\.analyze\.start$/)) {
+                        showSmartModeStatus(1, '✅ 查询完成' + (rows ? '（' + rows + ' 行）' : '') +
+                            (sec ? '，耗时 ' + sec + 's' : '') + '，等待分析报告...');
+                        var execId = (pl.exec_id || pl.query_id || '').trim();
+                        if (execId && execId !== '-' && execId !== smartModePipelinePollFetchedExecId) {
+                            smartModePipelinePollFetchedExecId = execId;
+                            fetchQueryResultById(execId).then(function (qr) {
+                                if (!qr) return;
+                                var sqlText = sqlEditor ? sqlEditor.getValue() : '';
+                                applyExecutionDataToUI({
+                                    success: true,
+                                    result: qr.result || [],
+                                    headers: qr.headers || [],
+                                    row_count: qr.row_count,
+                                    execution_time: qr.execution_time,
+                                    query_id: execId,
+                                    debug_info: {}
+                                }, sqlText);
+                            });
+                        }
+                    } else if (!ok && (has(/^agent\.repair_sql\.start$/) || has(/^pipeline\.execute\.fail$/))) {
+                        showSmartModeStatus(1, '🔧 执行失败，正在自动修复 SQL...');
+                    }
+                    if (has(/^pipeline\.analyze\.start$/) && !analyzeDone &&
+                        !has(/^pipeline\.analyze\.done$/) && !has(/^api\.run_pipeline\.exit$/)) {
+                        showSmartModeStatus(3, '📋 Step 4: 正在生成分析报告...');
+                        showSmartModeReportLoading(true);
+                    }
+                    if (analyzeDone || has(/^pipeline\.analyze\.done$/) || has(/^api\.run_pipeline\.exit$/)) {
+                        showSmartModeReportLoading(false);
+                    }
+                }
+            }
+
+            function showSmartModeReportLoading(on) {
+                var sec = document.getElementById('analysisReportSection');
+                var loading = document.getElementById('reportLoading');
+                var content = document.getElementById('reportContent');
+                if (!sec) return;
+                sec.classList.remove('d-none');
+                if (loading) {
+                    if (on) {
+                        loading.classList.remove('d-none');
+                        loading.style.display = 'block';
+                    } else {
+                        loading.classList.add('d-none');
+                        loading.style.display = 'none';
+                    }
+                }
+                if (content) {
+                    content.style.display = on ? 'none' : 'block';
+                }
+            }
+
+            function setSmartModeSubmitBusy(busy) {
+                var btn = document.getElementById('submitBtn');
+                if (!btn) return;
+                btn.disabled = !!busy;
+                btn.textContent = busy ? '智能模式执行中…' : '生成SQL';
+            }
 
             // 智能模式状态提示
             function showSmartModeStatus(step, message, isComplete = false) {
@@ -4861,7 +5501,332 @@
                 });
             }
 
-            // 智能模式：完整自动执行流程
+            function applyGenerateDataToUI(data) {
+                if (sqlEditor) sqlEditor.setValue(data.sql || '');
+                if (explanationEl) {
+                    if (!data.sql || !data.sql.trim()) {
+                        explanationEl.innerHTML = '<div class="alert alert-warning mb-0"><i class="bi bi-exclamation-triangle me-2"></i><strong>未生成SQL：</strong>' +
+                            (data.explanation || data.error || 'AI未能生成SQL') + '</div>';
+                    } else {
+                        explanationEl.textContent = data.explanation || '';
+                    }
+                }
+                if (tablesUsedEl) {
+                    tablesUsedEl.innerHTML = '';
+                    if (data.tables_used && data.tables_used.length > 0) {
+                        data.tables_used.forEach(function (table) {
+                            var badge = document.createElement('span');
+                            badge.className = 'badge bg-info text-dark';
+                            badge.textContent = table;
+                            tablesUsedEl.appendChild(badge);
+                        });
+                    } else {
+                        tablesUsedEl.innerHTML = '<span class="text-muted">未指定</span>';
+                    }
+                }
+                if (executionPlanSection && executionPlanEl) {
+                    if (data.execution_plan) {
+                        executionPlanSection.classList.remove('d-none');
+                        executionPlanEl.textContent = data.execution_plan;
+                    } else {
+                        executionPlanSection.classList.add('d-none');
+                    }
+                }
+                var genSec = data.generate_time != null ? data.generate_time : data.query_time;
+                if (queryTimeEl && genSec != null) queryTimeEl.textContent = Number(genSec).toFixed(2);
+                if (resultSection) resultSection.style.display = 'block';
+                if (sqlEditor) sqlEditor.refresh();
+            }
+
+            function applyExecutionDataToUI(exec, sqlText) {
+                if (!exec || !exec.success) return;
+                lastQueryResult = exec.result;
+                lastQueryHeaders = exec.headers;
+                currentQueryId = exec.query_id;
+                var cleanHeaders = buildCleanHeaders(exec);
+                lastSqlExecuteRowCount = exec.row_count != null ? exec.row_count : (Array.isArray(exec.result) ? exec.result.length : 0);
+
+                if (resultTableHeader && resultTableBody && cleanHeaders.length > 0) {
+                    fillResultTableHeaderRow(cleanHeaders);
+                    resultTableIsCtrData = cleanHeaders.some(function (h) {
+                        return h === 'ctr_percentage' || h.toLowerCase().includes('ctr') || h === 'analysis_date';
+                    });
+                    resultTablePagedRows = (exec.result || []).slice(0, RESULT_TABLE_MAX_ROWS);
+                    resultTableCleanHeaders = cleanHeaders;
+                    resultTablePageIndex = 0;
+                    renderResultTablePage();
+                    updateResultTablePaginationUI();
+                    attachResultTableSortListeners();
+                }
+                if (rowCount) rowCount.textContent = lastSqlExecuteRowCount + ' 行';
+                if (executionTime) executionTime.textContent = (exec.execution_time || 0).toFixed(2);
+                if (sqlResultSection) sqlResultSection.classList.remove('d-none');
+                updateSqlZeroRowsHint(exec);
+                window.lastCsvFilename = exec.debug_info && exec.debug_info.csv_filename;
+                window.lastSqlQueryType = detectSqlQueryType(sqlText || (sqlEditor ? sqlEditor.getValue() : ''), exec.headers);
+            }
+
+            function applyAnalysisDataToUI(analysis) {
+                if (!analysis || !analysis.success || !analysis.report) return;
+                var sec = document.getElementById('analysisReportSection');
+                var body = document.getElementById('analysisReportBody');
+                var content = document.getElementById('reportContent');
+                var meta = document.getElementById('reportMeta');
+                showSmartModeReportLoading(false);
+                if (sec) sec.classList.remove('d-none');
+                lastReportMarkdown = analysis.report;
+                showFeishuDocLink('');
+                lastReportHtml = sanitizeReportRenderedHtml(parseMarkdown(analysis.report));
+                if (body) {
+                    body.innerHTML = lastReportHtml;
+                    enhanceReportTables(body);
+                }
+                if (content) content.style.display = 'block';
+                if (meta) {
+                    meta.innerHTML = '分析耗时: ' + (analysis.analysis_time || 0).toFixed(2) + '秒 | 生成时间: ' + new Date().toLocaleString();
+                }
+            }
+
+            function isPipelinePermissionDenied(data, errMsg) {
+                errMsg = errMsg || '';
+                if (errMsg.indexOf('【权限不足') >= 0) return true;
+                if (data && data.error_kind === 'permission_denied') return true;
+                if (data && data.debug_info && data.debug_info.error_kind === 'permission_denied') return true;
+                var exec = data && data.execution;
+                if (exec && exec.debug_info && exec.debug_info.error_kind === 'permission_denied') return true;
+                return false;
+            }
+
+            function showSqlPermissionDeniedAlert(errMsg) {
+                if (!sqlErrorAlert) return;
+                sqlErrorAlert.className = 'alert alert-warning';
+                var pre = document.createElement('pre');
+                pre.className = 'mb-0 small';
+                pre.style.whiteSpace = 'pre-wrap';
+                pre.textContent = errMsg || '查询账号缺少表权限，已停止执行。';
+                sqlErrorAlert.innerHTML = '';
+                var title = document.createElement('h5');
+                title.textContent = '🔒 权限不足 — 已停止执行';
+                sqlErrorAlert.appendChild(title);
+                sqlErrorAlert.appendChild(pre);
+                sqlErrorAlert.classList.remove('d-none');
+            }
+
+            function hideSqlErrorAlert() {
+                if (sqlErrorAlert) sqlErrorAlert.classList.add('d-none');
+            }
+
+            function formatPipelineFailureAlert(data, errMsg) {
+                if (isPipelinePermissionDenied(data, errMsg)) {
+                    return '查询账号缺少表权限，已停止执行（不会自动修复）。\n\n' + errMsg;
+                }
+                return '自动执行失败（已尝试自动修复）: ' + errMsg;
+            }
+
+            // 将 /api/run-pipeline 响应应用到界面（生成 + 执行 + 可选分析）
+            function applyPipelineResponseToUI(data, rawQuery, opts) {
+                opts = opts || {};
+                if (!opts.skipGenerate) {
+                    applyGenerateDataToUI(data);
+                } else if (data.sql && sqlEditor) {
+                    sqlEditor.setValue(data.sql);
+                    sqlEditor.refresh();
+                }
+                if (data.attempts && data.attempts.length > 1 && explanationEl && data.sql) {
+                    var attemptInfo = '\n\n[Pipeline] 共 ' + data.attempts.length + ' 次尝试';
+                    var repaired = data.attempts.filter(function (a) { return a.repaired; }).length;
+                    if (repaired > 0) attemptInfo += '，自动修复 ' + repaired + ' 次';
+                    explanationEl.textContent = (data.explanation || '') + attemptInfo;
+                }
+                var exec = data.execution;
+                if (exec && exec.success) {
+                    applyExecutionDataToUI(exec, data.sql || '');
+                }
+                applyAnalysisDataToUI(data.analysis);
+
+                if (!data.success) {
+                    var failErr = data.error || (exec && exec.error) || '';
+                    if (isPipelinePermissionDenied(data, failErr)) {
+                        showSqlPermissionDeniedAlert(failErr);
+                    }
+                } else {
+                    hideSqlErrorAlert();
+                }
+
+                if (loadingSection) loadingSection.style.display = 'none';
+                if (resultSection) resultSection.style.display = 'block';
+                if (sqlEditor) sqlEditor.refresh();
+
+                saveToHistory(rawQuery, data, {
+                    step: exec && exec.success ? 2 : 1,
+                    status: data.success ? 'running' : 'failed',
+                    session_id: getOrCreateWebSessionId(),
+                    tid: getOrCreateFlowTrace(),
+                    query_id: exec && exec.query_id,
+                    row_count: exec && exec.row_count,
+                    headers: exec && exec.headers,
+                    data_preview: exec && exec.result ? truncateRowsForSnapshot(exec.result, 20) : []
+                });
+            }
+
+            async function runSmartModePipelineProgressive(composedQuery, rawQuery, flowTid) {
+                if (isSmartModeRunning) return;
+                isSmartModeRunning = true;
+                setSmartModeSubmitBusy(true);
+                smartModeStartTime = Date.now();
+                smartModeStepTimes = [0, 0, 0, 0];
+
+                if (loadingSection) loadingSection.style.display = 'none';
+                if (resultSection) resultSection.style.display = 'block';
+                showSmartModeStatus(0, '📝 Step 1: 正在生成 SQL...');
+                startSmartModePipelinePoll(flowTid);
+
+                try {
+                    var pipelineRequest = {
+                        query: composedQuery,
+                        history: [],
+                        temperature: temperatureSlider ? parseFloat(temperatureSlider.value) : 0.3,
+                        max_tokens: 4000,
+                        engine: currentSqlEngine,
+                        llm_model: currentLlmModel || null,
+                        max_retries: 2,
+                        max_rows: QUERY_RESULT_MAX_ROWS,
+                        timeout: 900,
+                        include_analyze: true,
+                        retry_zero_rows: true,
+                        chart_type: chartTypeSelect ? chartTypeSelect.value : null
+                    };
+
+                    var pipeRes = await fetch(apiUrl('/api/run-pipeline'), {
+                        method: 'POST',
+                        headers: buildJsonHeaders(flowTid),
+                        body: JSON.stringify(pipelineRequest)
+                    });
+
+                    if (!pipeRes.ok) throw new Error('Pipeline 请求失败: ' + pipeRes.status);
+                    stopSmartModePipelinePoll();
+                    var pipeData = await pipeRes.json();
+
+                    if (pipeData.generate_time) smartModeStepTimes[0] = pipeData.generate_time;
+                    if (pipeData.execution && pipeData.execution.execution_time) {
+                        smartModeStepTimes[1] = pipeData.execution.execution_time;
+                    }
+                    if (pipeData.analysis && pipeData.analysis.analysis_time) {
+                        smartModeStepTimes[3] = pipeData.analysis.analysis_time;
+                    }
+
+                    applyPipelineResponseToUI(pipeData, rawQuery);
+                    if (pipeData.analysis && pipeData.analysis.success && pipeData.analysis.report) {
+                        smartModeLastSnapReportKey = 'done:' + pipeData.analysis.report.length;
+                    }
+                    showSmartModeReportLoading(false);
+
+                    if (typeof window.saveWebSessionSnapshot === 'function') {
+                        window.saveWebSessionSnapshot(1, pipeData.success ? 'running' : 'failed', {
+                            smart_mode: true,
+                            generate_meta: {
+                                explanation: pipeData.explanation,
+                                tables_used: pipeData.tables_used,
+                                execution_plan: pipeData.execution_plan,
+                                attempts: pipeData.attempts
+                            }
+                        });
+                    }
+
+                    if (!pipeData.success || !pipeData.sql) {
+                        var errMsg = pipeData.error || (pipeData.execution && pipeData.execution.error) || '未知错误';
+                        var permDenied = isPipelinePermissionDenied(pipeData, errMsg);
+                        if (permDenied) {
+                            showSqlPermissionDeniedAlert(errMsg);
+                        }
+                        showSmartModeStatus(1, permDenied ? '🔒 权限不足: ' + errMsg.split('\n')[0] : ('❌ 执行失败: ' + errMsg), true);
+                        alert(formatPipelineFailureAlert(pipeData, errMsg));
+                        return;
+                    }
+
+                    await runSmartModeFromPipeline(pipeData, true);
+                } catch (error) {
+                    console.error('智能模式 Pipeline 失败:', error);
+                    var statusEl = document.getElementById('smartModeStatusEl');
+                    if (statusEl) {
+                        statusEl.innerHTML = '<div class="smart-mode-progress-panel" style="background: linear-gradient(135deg, #4a1a1a 0%, #3d1616 100%);">' +
+                            '<div class="smart-mode-message" style="background: rgba(231, 76, 60, 0.2); color: #ff6b6b;">' +
+                            '<strong>错误:</strong> ' + error.message + '</div></div>';
+                    }
+                    alert('智能模式执行出错: ' + error.message);
+                } finally {
+                    stopSmartModePipelinePoll();
+                    isSmartModeRunning = false;
+                    setSmartModeSubmitBusy(false);
+                    if (loadingSection) loadingSection.style.display = 'none';
+                }
+            }
+
+            // 智能模式（Pipeline）：执行+分析已由服务端完成时，仅做可视化
+            async function runSmartModeFromPipeline(pipelineData, alreadyInProgress) {
+                if (!alreadyInProgress) {
+                    if (isSmartModeRunning) {
+                        console.log('智能模式已在运行中');
+                        return;
+                    }
+                    isSmartModeRunning = true;
+                    smartModeStartTime = Date.now();
+                }
+                console.log('========== 智能模式(Pipeline)可视化 ==========');
+
+                if (!alreadyInProgress) {
+                    smartModeStepTimes = [
+                        pipelineData.generate_time || 0,
+                        (pipelineData.execution && pipelineData.execution.execution_time) || 0,
+                        0,
+                        (pipelineData.analysis && pipelineData.analysis.analysis_time) || 0
+                    ];
+                } else if (pipelineData.analysis && pipelineData.analysis.analysis_time) {
+                    smartModeStepTimes[3] = pipelineData.analysis.analysis_time;
+                }
+
+                try {
+                    var attemptNote = '';
+                    if (pipelineData.attempts && pipelineData.attempts.length > 1) {
+                        attemptNote = '（' + pipelineData.attempts.length + ' 次尝试）';
+                    }
+                    if (pipelineData.analysis && pipelineData.analysis.success) {
+                        smartModeStepTimes[3] = pipelineData.analysis.analysis_time || smartModeStepTimes[3];
+                        showSmartModeStatus(3, '📋 Step 4 完成 (' + (smartModeStepTimes[3] || 0).toFixed(1) + 's)，正在生成数据可视化...');
+                    } else {
+                        showSmartModeStatus(2, '📊 正在生成数据可视化...');
+                    }
+                    await new Promise(function (r) { setTimeout(r, 200); });
+
+                    startStepTimer();
+                    await smartModeVisualize();
+                    endStepTimer(2);
+
+                    var totalTime = ((Date.now() - smartModeStartTime) / 1000).toFixed(1);
+                    showSmartModeStatus(4, '🎉 全部完成！总耗时: ' + totalTime + 's', true);
+                    if (typeof window.saveWebSessionSnapshot === 'function') {
+                        window.saveWebSessionSnapshot(4, 'done', {
+                            smart_mode: true,
+                            report_html: lastReportHtml,
+                            query_id: pipelineData.execution && pipelineData.execution.query_id,
+                            row_count: pipelineData.execution && pipelineData.execution.row_count
+                        });
+                    }
+                    setTimeout(function () { hideSmartModeStatus(); }, 5000);
+                } catch (error) {
+                    console.error('智能模式(Pipeline)失败:', error);
+                    var statusEl = document.getElementById('smartModeStatusEl');
+                    if (statusEl) {
+                        statusEl.innerHTML = '<div class="smart-mode-progress-panel" style="background: linear-gradient(135deg, #4a1a1a 0%, #3d1616 100%);">' +
+                            '<div class="smart-mode-message" style="background: rgba(231, 76, 60, 0.2); color: #ff6b6b;">' +
+                            '<strong>错误:</strong> ' + error.message + '</div></div>';
+                    }
+                } finally {
+                    if (!alreadyInProgress) isSmartModeRunning = false;
+                }
+            }
+
+            // 智能模式：完整自动执行流程（非 Pipeline 路径，保留手动生成后逐步执行）
             async function runSmartMode() {
                 if (isSmartModeRunning) {
                     console.log('智能模式已在运行中');
@@ -5067,123 +6032,109 @@
                     e.preventDefault();
                     const query = queryInput.value.trim();
                     if (!query) return;
+                    const smOn = smartModeToggle && smartModeToggle.checked;
+                    if (isSqlFormSubmitting || (smOn && isSmartModeRunning)) {
+                        openPipelineTracePanel(getOrCreateFlowTrace(), true);
+                        return;
+                    }
+                    isSqlFormSubmitting = true;
                     const flowTid = startFlowTrace();
                     openPipelineTracePanel(flowTid, true);
-
-                    // 显示加载状态
-                    if (loadingSection) loadingSection.style.display = 'block';
-                    if (resultSection) resultSection.style.display = 'none';
 
                     try {
                         // 若启用了技能模板，前端先套模板得到最终 prompt；未启用则原样发送（行为与之前一致）
                         const composedQuery = await composeUserQueryAsync(query);
 
-                        // 构建API请求
-                        const requestData = {
-                            query: composedQuery,
-                            history: [],
-                            temperature: temperatureSlider ? parseFloat(temperatureSlider.value) : 0.3,
-                            max_tokens: 4000,
-                            engine: currentSqlEngine,
-                            llm_model: currentLlmModel || null
-                        };
+                        if (smOn) {
+                            // 智能模式：立即展示进度面板与结果区，分步更新（生成 → 执行 → 分析 → 可视化）
+                            if (loadingSection) loadingSection.style.display = 'none';
+                            if (resultSection) resultSection.style.display = 'block';
+                            await runSmartModePipelineProgressive(composedQuery, query, flowTid);
+                        } else {
+                            // 普通模式：显示加载状态，仅生成 SQL
+                            if (loadingSection) loadingSection.style.display = 'block';
+                            if (resultSection) resultSection.style.display = 'none';
+                            const requestData = {
+                                query: composedQuery,
+                                history: [],
+                                temperature: temperatureSlider ? parseFloat(temperatureSlider.value) : 0.3,
+                                max_tokens: 4000,
+                                engine: currentSqlEngine,
+                                llm_model: currentLlmModel || null
+                            };
 
-                        // 发送API请求
-                        const response = await fetch(apiUrl('/api/generate-sql'), {
-                            method: 'POST',
-                            headers: buildJsonHeaders(flowTid),
-                            body: JSON.stringify(requestData)
-                        });
-
-                        if (!response.ok) {
-                            throw new Error(`请求失败: ${response.status}`);
-                        }
-
-                        const data = await response.json();
-
-                        // 保存到历史记录
-                        var smOn = smartModeToggle && smartModeToggle.checked;
-                        saveToHistory(query, data, {
-                            step: 1,
-                            status: smOn ? 'running' : 'done',
-                            session_id: getOrCreateWebSessionId(),
-                            tid: flowTid
-                        });
-                        if (typeof window.saveWebSessionSnapshot === 'function') {
-                            window.saveWebSessionSnapshot(1, smOn ? 'running' : 'done', {
-                                generate_meta: {
-                                    explanation: data.explanation,
-                                    tables_used: data.tables_used,
-                                    execution_plan: data.execution_plan
-                                }
+                            const response = await fetch(apiUrl('/api/generate-sql'), {
+                                method: 'POST',
+                                headers: buildJsonHeaders(flowTid),
+                                body: JSON.stringify(requestData)
                             });
-                        }
 
-                        // 更新UI显示结果
-                        if (sqlEditor) sqlEditor.setValue(data.sql || '');
-                        if (explanationEl) {
-                            if (!data.sql || !data.sql.trim()) {
-                                explanationEl.innerHTML = '<div class="alert alert-warning mb-0"><i class="bi bi-exclamation-triangle me-2"></i><strong>未生成SQL：</strong>' + (data.explanation || 'AI未能生成SQL，请尝试更具体的描述') + '</div>';
-                            } else {
-                                explanationEl.textContent = data.explanation || '';
+                            if (!response.ok) {
+                                throw new Error('请求失败: ' + response.status);
                             }
-                        }
 
-                        // 显示使用的表
-                        if (tablesUsedEl) {
-                            tablesUsedEl.innerHTML = '';
-                            if (data.tables_used && data.tables_used.length > 0) {
-                                data.tables_used.forEach(table => {
-                                    const badge = document.createElement('span');
-                                    badge.className = 'badge bg-info text-dark';
-                                    badge.textContent = table;
-                                    tablesUsedEl.appendChild(badge);
+                            const data = await response.json();
+
+                            saveToHistory(query, data, {
+                                step: 1,
+                                status: 'done',
+                                session_id: getOrCreateWebSessionId(),
+                                tid: flowTid
+                            });
+                            if (typeof window.saveWebSessionSnapshot === 'function') {
+                                window.saveWebSessionSnapshot(1, 'done', {
+                                    generate_meta: {
+                                        explanation: data.explanation,
+                                        tables_used: data.tables_used,
+                                        execution_plan: data.execution_plan
+                                    }
                                 });
-                            } else {
-                                tablesUsedEl.innerHTML = '<span class="text-muted">未指定</span>';
                             }
-                        }
 
-                        // 显示执行计划(如果有)
-                        if (executionPlanSection && executionPlanEl) {
-                            if (data.execution_plan) {
-                                executionPlanSection.classList.remove('d-none');
-                                executionPlanEl.textContent = data.execution_plan;
-                            } else {
-                                executionPlanSection.classList.add('d-none');
-                            }
-                        }
-
-                        // 显示查询时间
-                        if (queryTimeEl) queryTimeEl.textContent = data.query_time.toFixed(2);
-
-                        // 隐藏加载，显示结果
-                        if (loadingSection) loadingSection.style.display = 'none';
-                        if (resultSection) resultSection.style.display = 'block';
-
-                        // 自动调整CodeMirror高度
-                        if (sqlEditor) sqlEditor.refresh();
-
-                        // 智能模式：SQL生成成功后自动执行后续流程
-                        if (smartModeToggle && smartModeToggle.checked) {
-                            if (data.sql && data.sql.trim()) {
-                                console.log('智能模式已启用，开始自动执行流程...');
-                                setTimeout(() => {
-                                    runSmartMode();
-                                }, 300);
-                            } else {
-                                console.log('智能模式：SQL为空，跳过自动执行');
-                                const msg = data.explanation || 'AI未能生成SQL，请尝试更具体的描述或提供表名关键词';
-                                if (explanationEl) {
-                                    explanationEl.innerHTML = '<div class="alert alert-warning mb-0"><i class="bi bi-exclamation-triangle me-2"></i><strong>未生成SQL：</strong>' + msg + '</div>';
+                            if (sqlEditor) sqlEditor.setValue(data.sql || '');
+                            if (explanationEl) {
+                                if (!data.sql || !data.sql.trim()) {
+                                    explanationEl.innerHTML = '<div class="alert alert-warning mb-0"><i class="bi bi-exclamation-triangle me-2"></i><strong>未生成SQL：</strong>' + (data.explanation || 'AI未能生成SQL，请尝试更具体的描述') + '</div>';
+                                } else {
+                                    explanationEl.textContent = data.explanation || '';
                                 }
                             }
+
+                            if (tablesUsedEl) {
+                                tablesUsedEl.innerHTML = '';
+                                if (data.tables_used && data.tables_used.length > 0) {
+                                    data.tables_used.forEach(table => {
+                                        const badge = document.createElement('span');
+                                        badge.className = 'badge bg-info text-dark';
+                                        badge.textContent = table;
+                                        tablesUsedEl.appendChild(badge);
+                                    });
+                                } else {
+                                    tablesUsedEl.innerHTML = '<span class="text-muted">未指定</span>';
+                                }
+                            }
+
+                            if (executionPlanSection && executionPlanEl) {
+                                if (data.execution_plan) {
+                                    executionPlanSection.classList.remove('d-none');
+                                    executionPlanEl.textContent = data.execution_plan;
+                                } else {
+                                    executionPlanSection.classList.add('d-none');
+                                }
+                            }
+
+                            if (queryTimeEl) queryTimeEl.textContent = data.query_time.toFixed(2);
+                            if (loadingSection) loadingSection.style.display = 'none';
+                            if (resultSection) resultSection.style.display = 'block';
+                            if (sqlEditor) sqlEditor.refresh();
                         }
 
                     } catch (error) {
                         console.error('SQL生成错误:', error);
                         alert('生成SQL时出错: ' + error.message);
                         if (loadingSection) loadingSection.style.display = 'none';
+                    } finally {
+                        isSqlFormSubmitting = false;
                     }
                 });
             }
@@ -5601,6 +6552,7 @@
                         if (progressStatus) progressStatus.style.display = 'block';
                         if (sqlResultSection) sqlResultSection.classList.add('d-none');
                         if (sqlErrorAlert) sqlErrorAlert.classList.add('d-none');
+                        if (sqlErrorAlert) sqlErrorAlert.className = 'alert alert-danger d-none';
                         updateSqlZeroRowsHint(null);
 
                         // 显示取消按钮，隐藏执行按钮
@@ -5650,9 +6602,24 @@
                         // 保存查询ID
                         currentQueryId = data.query_id;
 
-                        // 如果执行失败，显示错误信息
+                        // 如果执行失败，显示错误信息（权限不足时立即停止，提示申请 SELECT）
                         if (!data.success) {
-                            throw new Error(data.error || "未知错误");
+                            const errMsg = data.error || '未知错误';
+                            if (loadingSection) loadingSection.style.display = 'none';
+                            if (progressStatus) progressStatus.style.display = 'none';
+                            if (executeSqlBtn) executeSqlBtn.classList.remove('d-none');
+                            if (cancelSqlBtn) cancelSqlBtn.classList.add('d-none');
+                            if (sqlResultSection) sqlResultSection.classList.remove('d-none');
+                            if (isPipelinePermissionDenied(data, errMsg)) {
+                                showSqlPermissionDeniedAlert(errMsg);
+                            } else if (sqlErrorAlert) {
+                                sqlErrorAlert.className = 'alert alert-danger';
+                                sqlErrorAlert.innerHTML = '<h5>SQL执行失败</h5><pre class="mb-0 small">' +
+                                    errMsg.replace(/</g, '&lt;') + '</pre>';
+                                sqlErrorAlert.classList.remove('d-none');
+                            }
+                            resetUIState();
+                            return;
                         }
 
                         // 保存查询结果供后续使用
@@ -5816,9 +6783,12 @@
                                 `;
                                 sqlErrorAlert.classList.remove('d-none');
                             }
+                        } else if (errorMsg.indexOf('【权限不足') >= 0) {
+                            showSqlPermissionDeniedAlert(errorMsg);
                         } else {
                             // 更新错误提示
                             if (sqlErrorAlert) {
+                                sqlErrorAlert.className = 'alert alert-danger';
                                 sqlErrorAlert.innerHTML = `
                                     <h5>SQL执行失败</h5>
                                     <p>${error.message}</p>
@@ -8193,9 +9163,7 @@
                     sqlEditor.refresh();
                 }
                 if (snap.engine) {
-                    currentSqlEngine = snap.engine;
-                    var engSel = document.getElementById('sqlEngineSelect');
-                    if (engSel) engSel.value = snap.engine;
+                    switchEngine(snap.engine);
                 }
                 if (smartModeToggle && snap.smart_mode) smartModeToggle.checked = true;
 
@@ -8683,7 +9651,7 @@
 
             function getReportDocTitle() {
                 const q = queryInput ? queryInput.value.trim() : '';
-                const prefix = q ? q.slice(0, 60) : 'SQL AI 数据分析报告';
+                const prefix = q ? q.slice(0, 60) : 'Schemist 数据分析报告';
                 const ts = new Date().toISOString().slice(0, 16).replace('T', ' ');
                 return `${prefix} - ${ts}`;
             }

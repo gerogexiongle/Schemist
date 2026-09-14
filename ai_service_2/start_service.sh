@@ -38,8 +38,11 @@ echo "Log: $LOG_FILE"
 # Conda base（非交互 shell 需先 source conda.sh）
 if [ -f "${CONDA_PREFIX:-}/etc/profile.d/conda.sh" ]; then
     source "${CONDA_PREFIX}/etc/profile.d/conda.sh"
-elif [ -f "/minibdp/apps/anaconda3/etc/profile.d/conda.sh" ]; then
-    source "/minibdp/apps/anaconda3/etc/profile.d/conda.sh"
+elif command -v conda >/dev/null 2>&1; then
+    CONDA_BASE_DIR="$(conda info --base)"
+    if [ -f "$CONDA_BASE_DIR/etc/profile.d/conda.sh" ]; then
+        source "$CONDA_BASE_DIR/etc/profile.d/conda.sh"
+    fi
 fi
 if command -v conda >/dev/null 2>&1; then
     conda activate base

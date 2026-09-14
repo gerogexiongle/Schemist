@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-spark-submit get_spark_table_shecme_filter.py  --database ads_algo_cn --table "*"  --only-with-comments
+spark-submit get_spark_table_shecme_filter.py  --database example --table "*"  --only-with-comments
 spark-submit get_spark_table_shecme_filter.py  --database "*" --table "*"  --only-with-comments  # 支持遍历所有数据库
 spark-submit get_spark_table_shecme_filter.py  --database "*" --table "*"  --only-with-comments --check-data  # 检查最近分区是否有数据
 

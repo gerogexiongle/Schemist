@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 飞书开放平台 HTTP 客户端：tenant_access_token、拉取消息、回复消息、配置解析。
-覆盖本服务所需的 OpenAPI 子集（纯文本回复 + 可选交互卡片）。
+Schemist 飞书客户端：纯文本、交互卡片与云文档。
 """
 import json
 import logging
@@ -124,7 +124,7 @@ async def create_feishu_doc_from_markdown(
     folder_token: str = "",
 ) -> dict:
     """Create a Feishu docx document and insert Markdown as converted document blocks."""
-    safe_title = (title or "SQL AI 数据分析报告").strip()[:800] or "SQL AI 数据分析报告"
+    safe_title = (title or "Schemist 数据分析报告").strip()[:800] or "Schemist 数据分析报告"
     content = (markdown or "").strip()
     if not content:
         return {"success": False, "error": "Markdown content is empty"}

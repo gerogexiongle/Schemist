@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "schemist": {
+      "type": "http",
+      "url": "http://127.0.0.1:8889/mcp",
+      "tool_timeout_sec": 1200
+    }
+  }
+}

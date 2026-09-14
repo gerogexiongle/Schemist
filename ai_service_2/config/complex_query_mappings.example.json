@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "activation": {
+    "min_stages": 3,
+    "activate_without_marker_stages": 4,
+    "markers": [
+      "漏斗",
+      "链路"
+    ]
+  },
+  "stages": []
+}

@@ -319,7 +319,17 @@ def record_table_success_feedback(
         if engine:
             item["last_engine"] = str(engine).strip().lower()
         if query:
-            item["last_query"] = str(query)[:300]
+            query_text = str(query)[:300]
+            item["last_query"] = query_text
+            recent_queries = item.get("recent_queries", [])
+            if not isinstance(recent_queries, list):
+                recent_queries = []
+            # Keep a small per-table query history for query-specific retrieval.
+            recent_queries = [
+                str(value)[:300] for value in recent_queries
+                if value and str(value) != query_text
+            ]
+            item["recent_queries"] = ([query_text] + recent_queries)[:8]
         item["last_row_count"] = int(row_count or 0)
         stats[t] = item
         updated += 1
@@ -521,7 +531,7 @@ def _detect_query_intent(keyword: str, all_terms: List[str]) -> str:
     metrics_keys = ["ctr", "点击率", "曝光", "点击", "转化率", "大盘", "趋势", "汇总", "总量", "最近", "7天", "日"]
     detail_keys = ["明细", "日志", "request", "request_id", "行为", "样本", "raw", "dtl", "log"]
     exp_keys = ["实验", "ab", "exp", "exp_id", "对照组", "实验组", "显著", "pvalue", "p-value"]
-    dim_keys = ["按", "维度", "分组", "拆解", "渠道", "地图", "版本", "recall_type", "api_type", "map_id"]
+    dim_keys = ["按", "维度", "分组", "拆解", "渠道", "内容", "版本", "recall_type", "scene_id", "item_id"]
 
     def _count(keys: List[str]) -> int:
         return sum(1 for k in keys if k in text)
@@ -551,13 +561,7 @@ def _rewrite_query_terms(keyword: str, intent: str, all_terms: List[str]) -> Lis
     elif intent == "experiment":
         extra += ["实验", "ab", "exp_list", "exp_id", "对照组", "实验组"]
     elif intent == "dimension":
-        extra += ["分组", "维度", "group by", "api_type", "recall_type", "map_id"]
-
-    # Scene expansion (generic, not single-table hardcode)
-    if ("动态" in text and "推荐" in text) or "tweet" in text:
-        extra += ["tweet", "动态推荐", "tweet_reco", "reco_metrics"]
-    if ("联机" in text and "地图" in text) or "map" in text:
-        extra += ["map", "联机地图", "map_reco", "reco_metrics"]
+        extra += ["分组", "维度", "group by", "scene_id", "recall_type", "item_id"]
 
     # KPI phrase expansion
     if ("曝光" in text or "click" in text or "点击" in text) and ("ctr" in text or "点击率" in text):
@@ -575,7 +579,7 @@ def _table_type_feature_score(entry: TableIndexEntry, intent: str) -> float:
     - metrics intent boosts *_metrics_* / total / ctr/views/clicks columns
     - detail intent boosts behavior/log/dtl/request_id/is_view/is_click
     - experiment intent boosts exp/ab features
-    - dimension intent boosts *_mapid / api_type / recall_type / groupable fields
+    - dimension intent boosts *_mapid / scene_id / recall_type / groupable fields
     """
     tn = entry.table.lower()
     fn = entry.full_name.lower()
@@ -585,11 +589,11 @@ def _table_type_feature_score(entry: TableIndexEntry, intent: str) -> float:
     metrics_name_keys = ["metrics", "total", "summary", "ratio", "ctr"]
     metrics_col_keys = ["ctr", "views", "clicks", "reco", "total_view", "total_click"]
     detail_name_keys = ["behavior", "log", "dtl", "detail"]
-    detail_col_keys = ["request_id", "uin", "is_view", "is_click", "is_reco"]
+    detail_col_keys = ["request_id", "user_id", "is_view", "is_click", "is_reco"]
     exp_name_keys = ["ab", "exp", "experiment"]
     exp_col_keys = ["exp", "exp_list", "exp_id", "group"]
     dim_name_keys = ["mapid", "dim", "dimension"]
-    dim_col_keys = ["api_type", "recall_type", "map_id", "app_version", "channel"]
+    dim_col_keys = ["scene_id", "recall_type", "item_id", "app_version", "channel"]
 
     if intent == "metrics":
         score += sum(2.2 for k in metrics_name_keys if k in tn or k in fn)
@@ -975,6 +979,8 @@ def get_schema_feedback_stats(limit: int = 50) -> Dict:
             "last_success_ts": ts,
             "last_engine": item.get("last_engine", "") or "",
             "last_query": item.get("last_query", "") or "",
+            "recent_queries": item.get("recent_queries", [])
+            if isinstance(item.get("recent_queries", []), list) else [],
             "last_row_count": int(item.get("last_row_count", 0) or 0),
         })
 
@@ -994,6 +1000,72 @@ def get_schema_feedback_stats(limit: int = 50) -> Dict:
         "total_success_score": round(total_score, 4),
         "items": top_items,
     }
+
+
+def find_query_related_feedback_tables(query: str, limit: int = 5) -> List[Dict]:
+    """
+    Return tables learned from semantically similar successful queries.
+
+    This is intentionally separate from the global table-priority score. Callers
+    opt in (currently only the complex-funnel extension), so normal ranking stays
+    backward compatible.
+    """
+    n = max(0, min(int(limit or 0), 20))
+    if n == 0 or not str(query or "").strip():
+        return []
+    query_tokens = {token for token in tokenize(query) if len(token) >= 2}
+    if not query_tokens:
+        return []
+
+    payload = _load_feedback_data()
+    stats = payload.get("table_success_stats", {}) if isinstance(payload, dict) else {}
+    ranked = []
+    for table, item in stats.items():
+        if not isinstance(item, dict) or load_table_schema(table) is None:
+            continue
+        try:
+            success_score = float(item.get("success_score", 0) or 0.0)
+        except (TypeError, ValueError):
+            success_score = 0.0
+        # A single diagnostic/accidental query is too weak to become a candidate.
+        if success_score < 2.5:
+            continue
+        history = item.get("recent_queries", [])
+        if not isinstance(history, list):
+            history = []
+        last_query = item.get("last_query", "") or ""
+        if last_query and last_query not in history:
+            history = [last_query] + history
+
+        best_score = 0.0
+        best_query = ""
+        for old_query in history[:8]:
+            if re.search(r"核验|枚举|抽样|表结构|describe\b|show\b", str(old_query), re.IGNORECASE):
+                continue
+            old_tokens = {token for token in tokenize(str(old_query)) if len(token) >= 2}
+            if not old_tokens:
+                continue
+            common = query_tokens & old_tokens
+            if not common:
+                continue
+            coverage = len(common) / float(max(1, min(len(query_tokens), len(old_tokens))))
+            jaccard = len(common) / float(max(1, len(query_tokens | old_tokens)))
+            score = 0.7 * coverage + 0.3 * jaccard
+            if score > best_score:
+                best_score = score
+                best_query = str(old_query)
+        # One generic shared phrase should not influence retrieval.
+        if best_score < 0.12:
+            continue
+        ranked.append({
+            "table": table,
+            "similarity": round(best_score, 4),
+            "last_query": best_query[:300],
+            "success_score": success_score,
+        })
+
+    ranked.sort(key=lambda x: (-x["similarity"], -x["success_score"], x["table"]))
+    return ranked[:n]
 
 
 def list_unknown_tables_in_sql(sql):
@@ -1016,6 +1088,40 @@ def _find_table_alias(sql, table_full_name):
         if candidate.lower() not in SQL_KEYWORDS:
             return candidate
     return None
+
+
+def _find_alias_sources(sql, alias):
+    """Return all FROM/JOIN sources bound to an alias in this statement."""
+    if not sql or not alias:
+        return set()
+    clean = re.sub(r'/\*[\s\S]*?\*/', ' ', sql)
+    clean = re.sub(r'--[^\n\r]*', ' ', clean)
+    source_alias_pattern = re.compile(
+        r'\b(?:FROM|JOIN)\s+'
+        r'([a-zA-Z_][a-zA-Z0-9_$]*(?:\.[a-zA-Z_][a-zA-Z0-9_$]*){0,2})'
+        r'\s+(?:AS\s+)?([a-zA-Z_][a-zA-Z0-9_]*)',
+        re.IGNORECASE,
+    )
+    sources = set()
+    for match in source_alias_pattern.finditer(clean):
+        bound_alias = match.group(2)
+        if bound_alias.lower() == alias.lower() and bound_alias.lower() not in SQL_KEYWORDS:
+            sources.add(match.group(1).lower())
+    return sources
+
+
+def _alias_uniquely_binds_table(sql, alias, table_full_name):
+    """Guard global alias rewrites against CTE/nested-scope alias reuse."""
+    sources = _find_alias_sources(sql, alias)
+    if len(sources) != 1:
+        return False
+    source = next(iter(sources))
+    table_name = table_full_name.lower()
+    return (
+        source == table_name
+        or source.endswith('.' + table_name)
+        or table_name.endswith('.' + source)
+    )
 
 
 def _find_best_column_match(wrong_col, valid_columns):
@@ -1060,6 +1166,14 @@ def fix_columns_by_schema(sql):
         alias = _find_table_alias(sql, table_full)
 
         if alias:
+            if not _alias_uniquely_binds_table(sql, alias, table_full):
+                logger.warning(
+                    "schema fix skipped ambiguous alias: alias=%s table=%s sources=%s",
+                    alias,
+                    table_full,
+                    sorted(_find_alias_sources(sql, alias)),
+                )
+                continue
             pattern = re.compile(
                 r'(?<![a-zA-Z0-9_])' + re.escape(alias) + r'\.([a-zA-Z_][a-zA-Z0-9_]*)',
                 re.IGNORECASE

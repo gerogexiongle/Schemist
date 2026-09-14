@@ -6,7 +6,10 @@ Refactored with DeepAgent framework + Skills architecture
 Dual SQL engine support: Spark SQL + Trino
 """
 import csv
+import contextvars
+import hashlib
 import html
+import ipaddress
 import json
 import logging
 import re
@@ -14,6 +17,7 @@ import os
 import sys
 import time
 import uuid
+import asyncio
 
 import uvicorn
 import httpx
@@ -46,6 +50,8 @@ from config.settings import (
 from agents.sql_agent import generate_sql
 from agents.analysis_agent import analyze_data
 from skills.sql_executor import execute_sql, cancel_query
+from skills.sql_execution_errors import is_permission_denied_error
+from skills.sql_pipeline import run_sql_pipeline, DEFAULT_MAX_RETRIES, ZERO_ROWS_HINT
 from skills.query_result_cache import get_query_result, put_query_result
 from skills.web_session_store import get_web_session, save_web_session
 from skills.pipeline_trace import (
@@ -54,6 +60,8 @@ from skills.pipeline_trace import (
     new_http_trace_id,
     reset_trace_id,
     set_trace_id,
+    run_sync_in_executor,
+    get_trace_snapshot,
 )
 from skills.schema_skill import get_schema_feedback_stats, record_success_feedback_from_sql
 from skills.report_markdown_to_html import markdown_to_report_fragment_html
@@ -75,7 +83,7 @@ logger = logging.getLogger("sql_service_v2")
 
 app = FastAPI(
     title="Schemist · Schema-Guided SQL Assistant",
-    description="NL→SQL with local schema tools, validation, Spark SQL + Trino execution, analysis; DeepAgent + Skills.",
+    description="DeepAgent + Skills architecture, dual SQL engine (Spark + Trino)",
     version="2.0.0"
 )
 
@@ -102,9 +110,30 @@ _PIPELINE_SKIP_PATHS = frozenset(
     {
         "/favicon.ico",
         "/api/health",
+        "/mcp",
     }
 )
 _PIPELINE_SKIP_PREFIXES = ("/static/", "/docs", "/redoc", "/openapi.json")
+
+_CLIENT_IP_CTX = contextvars.ContextVar("request_client_ip", default="")
+_CLIENT_AGENT_CTX = contextvars.ContextVar("request_client_agent", default="")
+
+
+def _normalize_client_ip(value):
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = ipaddress.ip_address(raw)
+        if getattr(parsed, "ipv4_mapped", None):
+            return str(parsed.ipv4_mapped)
+        return str(parsed)
+    except ValueError:
+        return ""
+
+
+def _normalize_client_agent(value):
+    return " ".join(str(value or "").split()).strip()[:240]
 
 
 def _build_page_agent_upstream_chat_url() -> str:
@@ -128,21 +157,29 @@ def _build_page_agent_upstream_chat_url() -> str:
 @app.middleware("http")
 async def pipeline_http_middleware(request: Request, call_next):
     path = request.url.path
-    # 轮询追踪接口若走同一套中间件会把大量 http.enter/exit 混入业务 tid；且不设置 trace ContextVar
-    if path.startswith("/api/pipeline-trace") or path.startswith("/api/pipeline-feishu"):
-        return await call_next(request)
-    if path in _PIPELINE_SKIP_PATHS or any(path.startswith(p) for p in _PIPELINE_SKIP_PREFIXES):
-        return await call_next(request)
-    tid = new_http_trace_id(request.headers.get("x-request-id") or request.headers.get("X-Request-ID"))
-    tok = set_trace_id(tid)
+    client_ip = _normalize_client_ip(request.client.host if request.client else "")
+    client_agent = _normalize_client_agent(request.headers.get("user-agent"))
+    ip_tok = _CLIENT_IP_CTX.set(client_ip)
+    agent_tok = _CLIENT_AGENT_CTX.set(client_agent)
     try:
-        pipeline_log(logger, "http.enter", path=path, method=request.method)
-        response = await call_next(request)
-        response.headers["X-Trace-Id"] = pipeline_get_tid()
-        pipeline_log(logger, "http.exit", path=path, status=response.status_code)
-        return response
+        # 轮询追踪接口若走同一套中间件会把大量 http.enter/exit 混入业务 tid；且不设置 trace ContextVar
+        if path.startswith("/api/pipeline-trace") or path.startswith("/api/pipeline-feishu"):
+            return await call_next(request)
+        if path in _PIPELINE_SKIP_PATHS or any(path.startswith(p) for p in _PIPELINE_SKIP_PREFIXES):
+            return await call_next(request)
+        tid = new_http_trace_id(request.headers.get("x-request-id") or request.headers.get("X-Request-ID"))
+        tok = set_trace_id(tid)
+        try:
+            pipeline_log(logger, "http.enter", path=path, method=request.method, client_ip=client_ip)
+            response = await call_next(request)
+            response.headers["X-Trace-Id"] = pipeline_get_tid()
+            pipeline_log(logger, "http.exit", path=path, status=response.status_code)
+            return response
+        finally:
+            reset_trace_id(tok)
     finally:
-        reset_trace_id(tok)
+        _CLIENT_IP_CTX.reset(ip_tok)
+        _CLIENT_AGENT_CTX.reset(agent_tok)
 
 
 # ======================== Pydantic Models ========================
@@ -154,19 +191,26 @@ class SQLGenerationRequest(BaseModel):
     temperature: float = 0.3
     engine: str = SQL_ENGINE_DEFAULT
     llm_model: Optional[str] = None
+    source: str = "web"
 
 class SQLGenerationResponse(BaseModel):
     sql: str
     explanation: str
     execution_plan: Optional[str] = None
     tables_used: List[str] = []
+    semantic_complete: bool = True
+    semantic_coverage: Optional[Dict] = None
+    missing_stages: List[str] = []
+    retrieval_strategy: str = "default"
     query_time: float
 
 class SQLExecutionRequest(BaseModel):
     sql: str
+    question: str = ""
     max_rows: int = QUERY_RESULT_MAX_ROWS
     timeout: int = SQL_EXECUTOR_TIMEOUT
     engine: str = SQL_ENGINE_DEFAULT
+    source: str = "web"
 
 class SQLExecutionResponse(BaseModel):
     success: bool
@@ -239,8 +283,59 @@ class DataAnalysisResponse(BaseModel):
     analysis_time: float = 0
 
 
+class PipelineAttemptInfo(BaseModel):
+    attempt: int
+    phase: str
+    sql_chars: int = 0
+    success: bool = False
+    error: Optional[str] = None
+    repaired: bool = False
+    row_count: Optional[int] = None
+    execution_time: Optional[float] = None
+
+
+class PipelineRunRequest(BaseModel):
+    query: str
+    history: List[Dict[str, str]] = []
+    engine: str = SQL_ENGINE_DEFAULT
+    llm_model: Optional[str] = None
+    temperature: float = 0.3
+    max_tokens: int = 4000
+    max_retries: int = DEFAULT_MAX_RETRIES
+    max_rows: int = QUERY_RESULT_MAX_ROWS
+    timeout: int = SQL_EXECUTOR_TIMEOUT
+    include_analyze: bool = True
+    retry_zero_rows: bool = True
+    chart_type: Optional[str] = None
+    sql: Optional[str] = None
+    explanation: Optional[str] = None
+    tables_used: Optional[List[str]] = None
+    execution_plan: Optional[str] = None
+    generate_time: Optional[float] = None
+    source: str = "web"
+
+
+class PipelineRunResponse(BaseModel):
+    success: bool
+    sql: str = ""
+    explanation: str = ""
+    tables_used: List[str] = []
+    execution_plan: Optional[str] = None
+    generate_time: float = 0
+    pipeline_time: float = 0
+    attempts: List[PipelineAttemptInfo] = []
+    execution: Optional[SQLExecutionResponse] = None
+    analysis: Optional[DataAnalysisResponse] = None
+    error: Optional[str] = None
+    error_kind: Optional[str] = None
+    semantic_complete: bool = True
+    semantic_coverage: Optional[Dict] = None
+    missing_stages: List[str] = []
+    retrieval_strategy: str = "default"
+
+
 class FeishuDocMarkdownRequest(BaseModel):
-    title: str = "SQL AI 数据分析报告"
+    title: str = "Schemist 数据分析报告"
     markdown: str
     folder_token: str = ""
 
@@ -280,13 +375,50 @@ def _save_history():
         logger.warning("Failed to save history: %s", e)
 
 
-def record_query(query_type, engine, question="", sql="", success=True, duration=0, error="", tables=None, row_count=0):
+def _history_question_id(question):
+    normalized = " ".join(str(question or "").split()).strip().lower()
+    if not normalized:
+        return ""
+    return "q_{}".format(hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12])
+
+
+def _history_source(source):
+    value = (source or "web").strip().lower()
+    return value if value in ("web", "feishu", "mcp", "api") else "api"
+
+
+def record_query(
+    query_type,
+    engine,
+    question="",
+    sql="",
+    success=True,
+    duration=0,
+    error="",
+    tables=None,
+    row_count=0,
+    source="web",
+    trace_id="",
+    query_id="",
+    client_ip="",
+    client_agent="",
+):
+    history_trace_id = (trace_id or pipeline_get_tid() or "").strip()[:64]
+    if history_trace_id == "-":
+        history_trace_id = ""
     entry = {
         "id": uuid.uuid4().hex[:8],
         "type": query_type,
         "engine": engine,
-        "question": question[:200] if question else "",
-        "sql": sql[:500] if sql else "",
+        "source": _history_source(source),
+        "trace_id": history_trace_id,
+        "question_id": _history_question_id(question),
+        "query_id": (query_id or "").strip(),
+        "client_ip": _normalize_client_ip(client_ip) or _CLIENT_IP_CTX.get(),
+        "client_agent": _normalize_client_agent(client_agent) or _CLIENT_AGENT_CTX.get(),
+        "question": question or "",
+        "sql": sql or "",
+        "sql_truncated": False,
         "success": success,
         "duration": round(duration, 2),
         "error": error[:200] if error else "",
@@ -296,8 +428,7 @@ def record_query(query_type, engine, question="", sql="", success=True, duration
     }
     with _history_lock:
         _query_history.append(entry)
-        if len(_query_history) % 5 == 0:
-            _save_history()
+        _save_history()
 
 
 _load_history()
@@ -311,7 +442,8 @@ async def api_pipeline_trace(tid: str):
     from skills.pipeline_trace import get_trace_events
 
     ev = get_trace_events(tid)
-    return {"tid": tid, "event_count": len(ev), "events": ev}
+    snap = get_trace_snapshot(tid)
+    return {"tid": tid, "event_count": len(ev), "events": ev, "snapshot": snap}
 
 
 @app.get("/api/pipeline-feishu-recent")
@@ -327,7 +459,7 @@ async def get_index(request: Request):
     # Keep real key server-side only; frontend uses proxy baseURL + public placeholder key.
     page_agent_base_url = "/api/page-agent-proxy/v1"
     page_agent_api_key = (os.environ.get("PAGE_AGENT_PUBLIC_KEY") or "page-agent-proxy").strip()
-    page_agent_model = (os.environ.get("PAGE_AGENT_MODEL") or LLM_MODEL or "ws/kimi-k2.6").strip()
+    page_agent_model = (os.environ.get("PAGE_AGENT_MODEL") or LLM_MODEL or "gpt-4o-mini").strip()
     return templates.TemplateResponse(
         "index.html",
         {
@@ -393,7 +525,10 @@ async def api_generate_sql(request: SQLGenerationRequest):
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     try:
-        result = generate_sql(
+        loop = asyncio.get_event_loop()
+        result = await run_sync_in_executor(
+            loop,
+            generate_sql,
             query=request.query,
             history=request.history,
             engine=request.engine,
@@ -404,7 +539,7 @@ async def api_generate_sql(request: SQLGenerationRequest):
         pipeline_log(
             logger,
             "api.generate_sql.exit",
-            ok=bool(result.get("sql")),
+            ok=bool(result.get("sql")) and bool(result.get("semantic_complete", True)),
             sql_chars=len(result.get("sql") or ""),
             tables=len(result.get("tables_used") or []),
             sec=result.get("query_time"),
@@ -414,21 +549,161 @@ async def api_generate_sql(request: SQLGenerationRequest):
             engine=request.engine,
             question=request.query,
             sql=result.get("sql", ""),
-            success=bool(result.get("sql")),
+            success=bool(result.get("sql")) and bool(result.get("semantic_complete", True)),
             duration=result.get("query_time", 0),
             tables=result.get("tables_used", []),
+            source=request.source,
         )
         return SQLGenerationResponse(
             sql=result["sql"],
             explanation=result["explanation"],
             tables_used=result.get("tables_used", []),
             execution_plan=result.get("execution_plan"),
+            semantic_complete=bool(result.get("semantic_complete", True)),
+            semantic_coverage=result.get("semantic_coverage"),
+            missing_stages=result.get("missing_stages") or [],
+            retrieval_strategy=result.get("retrieval_strategy") or "default",
             query_time=result["query_time"],
         )
     except Exception as e:
         logger.exception("generate-sql error: %s", e)
         pipeline_log(logger, "api.generate_sql.exception", err=str(e)[:200])
-        record_query(query_type="generate", engine=request.engine, question=request.query, success=False, error=str(e))
+        record_query(
+            query_type="generate",
+            engine=request.engine,
+            question=request.query,
+            success=False,
+            error=str(e),
+            source=request.source,
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/run-pipeline", response_model=PipelineRunResponse)
+async def api_run_pipeline(request: PipelineRunRequest):
+    pipeline_log(
+        logger,
+        "api.run_pipeline.enter",
+        engine=request.engine,
+        q_chars=len(request.query or ""),
+        max_retries=request.max_retries,
+        analyze=request.include_analyze,
+    )
+    try:
+        llm_model = resolve_llm_model(request.llm_model)
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    try:
+        loop = asyncio.get_event_loop()
+        pre_sql = (request.sql or "").strip() or None
+        result = await run_sync_in_executor(
+            loop,
+            run_sql_pipeline,
+            query=request.query,
+            history=request.history,
+            engine=request.engine,
+            llm_model=llm_model,
+            temperature=request.temperature,
+            max_tokens=request.max_tokens,
+            max_retries=request.max_retries,
+            max_rows=request.max_rows,
+            timeout=request.timeout,
+            include_analyze=request.include_analyze,
+            retry_zero_rows=request.retry_zero_rows,
+            chart_type=request.chart_type,
+            pre_sql=pre_sql,
+            pre_explanation=request.explanation or "",
+            pre_tables_used=request.tables_used,
+            pre_execution_plan=request.execution_plan,
+            pre_generate_time=request.generate_time or 0,
+        )
+        exec_block = result.get("execution") or {}
+        analysis_block = result.get("analysis")
+
+        record_query(
+            query_type="generate",
+            engine=request.engine,
+            question=request.query,
+            sql=result.get("sql", ""),
+            success=bool(result.get("sql")) and bool(result.get("semantic_complete", True)),
+            duration=result.get("generate_time", 0),
+            tables=result.get("tables_used") or [],
+            source=request.source,
+        )
+        if exec_block:
+            record_query(
+                query_type="execute",
+                engine=request.engine,
+                question=request.query,
+                sql=result.get("sql", ""),
+                success=bool(exec_block.get("success")),
+                duration=exec_block.get("execution_time", 0),
+                error=exec_block.get("error") or "",
+                row_count=exec_block.get("row_count", 0),
+                source=request.source,
+                query_id=exec_block.get("query_id") or "",
+            )
+
+        pipeline_log(
+            logger,
+            "api.run_pipeline.exit",
+            ok=result.get("success"),
+            attempts=len(result.get("attempts") or []),
+            rows=(exec_block.get("row_count") if exec_block else 0),
+            sec=result.get("pipeline_time"),
+        )
+
+        execution_resp = None
+        if exec_block:
+            execution_resp = SQLExecutionResponse(
+                success=bool(exec_block.get("success")),
+                result=exec_block.get("result") or [],
+                headers=exec_block.get("headers") or [],
+                error=exec_block.get("error"),
+                execution_time=exec_block.get("execution_time") or 0,
+                row_count=exec_block.get("row_count") or 0,
+                query_id=exec_block.get("query_id"),
+                debug_info=exec_block.get("debug_info"),
+            )
+
+        analysis_resp = None
+        if analysis_block:
+            analysis_resp = DataAnalysisResponse(
+                success=bool(analysis_block.get("success")),
+                report=analysis_block.get("report") or "",
+                error=analysis_block.get("error"),
+                analysis_time=analysis_block.get("analysis_time") or 0,
+            )
+
+        return PipelineRunResponse(
+            success=bool(result.get("success")),
+            sql=result.get("sql") or "",
+            explanation=result.get("explanation") or "",
+            tables_used=result.get("tables_used") or [],
+            execution_plan=result.get("execution_plan"),
+            generate_time=result.get("generate_time") or 0,
+            pipeline_time=result.get("pipeline_time") or 0,
+            attempts=[PipelineAttemptInfo(**a) for a in (result.get("attempts") or [])],
+            execution=execution_resp,
+            analysis=analysis_resp,
+            error=result.get("error"),
+            error_kind=result.get("error_kind"),
+            semantic_complete=bool(result.get("semantic_complete", True)),
+            semantic_coverage=result.get("semantic_coverage"),
+            missing_stages=result.get("missing_stages") or [],
+            retrieval_strategy=result.get("retrieval_strategy") or "default",
+        )
+    except Exception as e:
+        logger.exception("run-pipeline error: %s", e)
+        pipeline_log(logger, "api.run_pipeline.exception", err=str(e)[:200])
+        record_query(
+            query_type="generate",
+            engine=request.engine,
+            question=request.query,
+            success=False,
+            error=str(e),
+            source=request.source,
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -442,7 +717,10 @@ async def api_execute_sql(request: SQLExecutionRequest):
         max_rows=request.max_rows,
     )
     try:
-        success, headers, results, error, exec_time, query_id, debug_info = execute_sql(
+        loop = asyncio.get_event_loop()
+        success, headers, results, error, exec_time, query_id, debug_info = await run_sync_in_executor(
+            loop,
+            execute_sql,
             sql=request.sql,
             engine=request.engine,
             max_rows=request.max_rows,
@@ -451,20 +729,25 @@ async def api_execute_sql(request: SQLExecutionRequest):
         record_query(
             query_type="execute",
             engine=request.engine,
+            question=request.question,
             sql=request.sql,
             success=success,
             duration=exec_time,
             error=error or "",
             row_count=len(results),
+            source=request.source,
+            query_id=query_id or "",
         )
         di = dict(debug_info or {})
+        if not success and error and is_permission_denied_error(error):
+            di["error_kind"] = "permission_denied"
         feedback_info = None
         # Lightweight online learning: only reinforce tables after a successful execution with non-empty result.
         if success and len(results) > 0:
             try:
                 feedback_info = record_success_feedback_from_sql(
                     sql=request.sql,
-                    query="",
+                    query=request.question,
                     engine=request.engine,
                     row_count=len(results),
                 )
@@ -497,12 +780,7 @@ async def api_execute_sql(request: SQLExecutionRequest):
             except Exception as ce:
                 logger.warning("query_result_cache put failed: %s", ce)
         if success and len(results) == 0:
-            di["zero_rows_hint"] = (
-                "查询成功但结果集为 0 行（前端与接口正常）。请核对：① 分区 dt 在范围内是否有数据；"
-                "② WHERE 条件是否与库里实际取值一致。常见情况：表 dws_cn.dws_behavior_map_game_reco_i_d "
-                "的字段 api_type 落库多为五位字符串 '40001'，业务口语「API 4001」若写成 '4001'（四位）会查不到数据。"
-                "可先执行：SELECT DISTINCT api_type FROM dws_cn.dws_behavior_map_game_reco_i_d WHERE dt='最近有数据的一天' LIMIT 50 核对枚举。"
-            )
+            di["zero_rows_hint"] = ZERO_ROWS_HINT
         return SQLExecutionResponse(
             success=success,
             result=results,
@@ -516,7 +794,15 @@ async def api_execute_sql(request: SQLExecutionRequest):
     except Exception as e:
         logger.exception("execute-sql error: %s", e)
         pipeline_log(logger, "api.execute_sql.exception", err=str(e)[:200])
-        record_query(query_type="execute", engine=request.engine, sql=request.sql, success=False, error=str(e))
+        record_query(
+            query_type="execute",
+            engine=request.engine,
+            question=request.question,
+            sql=request.sql,
+            success=False,
+            error=str(e),
+            source=request.source,
+        )
         return SQLExecutionResponse(
             success=False, error=str(e), execution_time=0, row_count=0
         )
@@ -763,7 +1049,15 @@ async def api_schema_feedback_stats(limit: int = Query(50, ge=1, le=500)):
 
 
 @app.get("/api/query-history")
-async def api_query_history(limit: int = 50, engine: str = None, query_type: str = None):
+async def api_query_history(
+    limit: int = Query(50, ge=1, le=500),
+    engine: str = None,
+    query_type: str = None,
+    source: str = None,
+    trace_id: str = None,
+    question_id: str = None,
+    client_ip: str = None,
+):
     """Return filtered query history."""
     with _history_lock:
         history = list(_query_history)
@@ -772,6 +1066,14 @@ async def api_query_history(limit: int = 50, engine: str = None, query_type: str
         history = [h for h in history if h.get("engine") == engine]
     if query_type:
         history = [h for h in history if h.get("type") == query_type]
+    if source:
+        history = [h for h in history if h.get("source") == source]
+    if trace_id:
+        history = [h for h in history if h.get("trace_id") == trace_id]
+    if question_id:
+        history = [h for h in history if h.get("question_id") == question_id]
+    if client_ip:
+        history = [h for h in history if h.get("client_ip") == client_ip.strip()]
 
     return {"items": list(reversed(history[-limit:])), "total": len(history)}
 
@@ -1092,7 +1394,7 @@ async def view_shared_report(share_id: str, request: Request):
 {report_block}
 </div>
 <div class="footer-bar">
-Schemist · Schema-Guided SQL Assistant &middot; 分享报告 &middot; 有效期至 {expires_at}
+Schemist V2 &middot; 分享报告 &middot; 有效期至 {expires_at}
 </div>
 </div>
 <script>
@@ -1152,8 +1454,18 @@ function downloadSharedTableCsv() {{
     return HTMLResponse(content=html)
 
 
-from feishu_bot_api import router as feishu_router
+from feishu_bot_api import (
+    router as feishu_router,
+    set_query_recorder,
+    set_shared_report_services,
+)
 
+set_query_recorder(record_query)
+set_shared_report_services(
+    persist_shared_report,
+    build_shared_table_html,
+    markdown_report_to_share_html,
+)
 app.include_router(feishu_router)
 
 
@@ -1287,6 +1599,23 @@ async def api_render_skill(skill_id: str, payload: SkillRenderPayload):
         "rendered": rendered,
         "variables": variables,
     }
+
+
+# MCP is registered after the API handlers so it can reuse the same validated
+# request models and pipeline functions as the Web and Feishu clients.
+from mcp_api import create_mcp_router
+
+app.include_router(
+    create_mcp_router(
+        pipeline_handler=api_run_pipeline,
+        generate_handler=api_generate_sql,
+        execute_handler=api_execute_sql,
+        health_handler=health_check,
+        pipeline_request_factory=PipelineRunRequest,
+        generate_request_factory=SQLGenerationRequest,
+        execute_request_factory=SQLExecutionRequest,
+    )
+)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from config.settings import (
     SPARK_EXTRA_CONFS,
     SQL_EXECUTOR_TIMEOUT,
     TRINO_HOST, TRINO_PORT, TRINO_USER, TRINO_PASSWORD, TRINO_CATALOG, TRINO_SCHEMA,
+    TRINO_ROLES, TRINO_HIVE_ROLE_PRIORITY, TRINO_SET_HIVE_ROLE_FALLBACK,
     TEMP_SQL_DIR, TEMP_CSV_DIR, QUERY_RESULT_MAX_ROWS,
 )
 from skills.sql_validator import (
@@ -27,6 +28,7 @@ from skills.sql_validator import (
     validate_engine_sql,
 )
 from skills.pipeline_trace import log as pipeline_log
+from skills.sql_execution_errors import format_execution_error_for_user, is_permission_denied_error
 
 logger = logging.getLogger("sql_executor")
 
@@ -100,6 +102,28 @@ def _is_allowed_query_type(sql):
             continue
         break
     return bool(re.match(r"^(select|with|explain|show|describe|desc)\b", s, flags=re.IGNORECASE))
+
+
+def _should_trino_explain(sql):
+    """Only SELECT/WITH statements need Trino's type-aware validation."""
+    if not sql:
+        return False
+    s = sql.lstrip()
+    while True:
+        if s.startswith("--"):
+            nl = s.find("\n")
+            if nl == -1:
+                return False
+            s = s[nl + 1:].lstrip()
+            continue
+        if s.startswith("/*"):
+            end = s.find("*/", 2)
+            if end == -1:
+                return False
+            s = s[end + 2:].lstrip()
+            continue
+        break
+    return bool(re.match(r"^(select|with)\b", s, flags=re.IGNORECASE))
 
 os.makedirs(TEMP_SQL_DIR, exist_ok=True)
 os.makedirs(TEMP_CSV_DIR, exist_ok=True)
@@ -469,7 +493,7 @@ def execute_spark_sql(sql, max_rows=QUERY_RESULT_MAX_ROWS, timeout=None):
             # 任意条可通过环境变量 SPARK_SQL_SET_OVERRIDES 覆盖（同名后置生效，per-query 临时设置）
             #
             # ⚠️ 不要把 autoBroadcastJoinThreshold 设得过大（如 512m+）+ driver 仅 4~6g：
-            # 实测在 AB 实验 11 天窗口下，clicked CTE distinct(dt,uin,map_id) 序列化体积超过阈值时，
+            # 大窗口多表关联的中间结果序列化体积超过阈值时，
             # 强制 broadcast 会触发 driver 端 "Store broadcast fail / Multiple failures in stage materialization"。
             # 256m 是经验值：让 AQE 在小数据时仍走 BHJ，大数据自动 fallback SMJ，避免 driver OOM。
             f.write("SET spark.sql.autoBroadcastJoinThreshold=268435456;\n")  # 256MB
@@ -606,14 +630,163 @@ def execute_spark_sql(sql, max_rows=QUERY_RESULT_MAX_ROWS, timeout=None):
             pass
 
 
-def _create_trino_connection():
-    """Create a Trino DBAPI connection."""
-    import warnings
-    import trino as trino_lib
-    warnings.filterwarnings('ignore', '.*InsecureRequestWarning*', Warning)
-    warnings.filterwarnings('ignore', '.*Unverified HTTPS*', Warning)
+def _parse_trino_roles(raw):
+    """Parse TRINO_ROLES into catalog→role map (and optional bare ALL/NONE).
 
-    conn = trino_lib.dbapi.connect(
+    Accepts:
+      - ``hive=admin`` / ``hive:admin``
+      - ``hive=admin,system=admin`` (multi catalog)
+      - bare ``admin`` / ``ALL`` / ``NONE``
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None, None
+    if "," not in s and "=" not in s and ":" not in s:
+        return None, s
+    out = {}
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+        elif ":" in part:
+            k, v = part.split(":", 1)
+        else:
+            out["hive"] = part
+            continue
+        k, v = k.strip(), v.strip()
+        if k and v:
+            out[k] = v
+    return (out if out else None), None
+
+
+def _hive_role_priority_order():
+    parts = tuple(
+        p.strip().lower()
+        for p in (TRINO_HIVE_ROLE_PRIORITY or "admin,analytics,public").split(",")
+        if p.strip()
+    )
+    return parts or ("admin", "analytics", "public")
+
+
+def _pick_best_hive_role(role_names):
+    """Pick highest-priority role from applicable_roles ∩ TRINO_HIVE_ROLE_PRIORITY."""
+    order = _hive_role_priority_order()
+    allow = {x.lower() for x in order}
+    picks = []
+    seen = set()
+    for r in role_names or []:
+        n = str(r or "").strip()
+        if n.lower().startswith("role{") and n.endswith("}"):
+            n = n[5:-1].strip()
+        if not n or not re.fullmatch(r"[A-Za-z0-9_]+", n):
+            continue
+        lk = n.lower()
+        if lk not in allow or lk in seen:
+            continue
+        seen.add(lk)
+        picks.append(n)
+    if not picks:
+        return None
+
+    def _rank(name):
+        try:
+            return order.index(name.lower())
+        except ValueError:
+            return len(order) + 1
+
+    return min(picks, key=_rank)
+
+
+def _format_trino_role_token(role):
+    """Build an X-Trino-Role value token: ``ROLE{name}`` (or ALL/NONE literal)."""
+    r = (role or "").strip()
+    if r.upper() in ("ALL", "NONE"):
+        return r.upper()
+    return "ROLE{%s}" % r
+
+
+def _role_header_from_map(catalog_roles):
+    """{'hive': 'admin'} → 'hive=ROLE{admin}' (comma-joined for multi catalog)."""
+    if not catalog_roles:
+        return None
+    segs = []
+    for cat, role in catalog_roles.items():
+        cat = str(cat).strip()
+        role = str(role).strip()
+        if not cat or not role:
+            continue
+        segs.append("{}={}".format(cat, _format_trino_role_token(role)))
+    return ",".join(segs) if segs else None
+
+
+def _role_header_from_config():
+    """X-Trino-Role from TRINO_ROLES env (e.g. ``hive=admin``)."""
+    catalog_roles, bare = _parse_trino_roles(TRINO_ROLES)
+    if catalog_roles:
+        return _role_header_from_map(catalog_roles)
+    if bare:
+        return _role_header_from_map({"hive": bare})
+    return None
+
+
+def _discover_hive_role_header(base_conn):
+    """Query applicable_roles and pick best hive role → 'hive=ROLE{admin}' (or None)."""
+    if not TRINO_SET_HIVE_ROLE_FALLBACK:
+        return None
+    try:
+        cur = base_conn.cursor()
+        cur.execute(
+            "SELECT role_name FROM hive.information_schema.applicable_roles "
+            "WHERE lower(cast(grantee AS varchar)) = lower(cast(current_user AS varchar))"
+        )
+        rows = cur.fetchall()
+        cur.close()
+    except Exception as e:
+        logger.warning("Trino applicable_roles query failed, skip role header: %s", e)
+        return None
+    names = [
+        str(row[0]).strip()
+        for row in rows
+        if row and row[0] is not None and str(row[0]).strip()
+    ]
+    picked = _pick_best_hive_role(names)
+    if not picked:
+        logger.warning(
+            "Trino applicable_roles has no overlap with TRINO_HIVE_ROLE_PRIORITY "
+            "(sample=%s), skip role header",
+            names[:20],
+        )
+        return None
+    return _role_header_from_map({"hive": picked})
+
+
+def _ensure_trino_host_bypasses_proxy():
+    """内网 Trino 经 HTTP_PROXY 常 SSL 握手超时；把 TRINO_HOST 加入 NO_PROXY。"""
+    host = (TRINO_HOST or "").strip()
+    if not host:
+        return
+    extras = [host]
+    # 若配置的是域名，同时加一份小写，避免大小写不一致
+    if host.lower() != host:
+        extras.append(host.lower())
+    for key in ("NO_PROXY", "no_proxy"):
+        cur = (os.environ.get(key) or "").strip()
+        parts = [p.strip() for p in cur.split(",") if p.strip()]
+        lower_set = {p.lower() for p in parts}
+        changed = False
+        for h in extras:
+            if h.lower() not in lower_set:
+                parts.append(h)
+                lower_set.add(h.lower())
+                changed = True
+        if changed:
+            os.environ[key] = ",".join(parts)
+
+
+def _raw_trino_connect(trino_lib, http_headers=None):
+    return trino_lib.dbapi.connect(
         host=TRINO_HOST,
         port=TRINO_PORT,
         user=TRINO_USER,
@@ -622,8 +795,46 @@ def _create_trino_connection():
         http_scheme="https",
         auth=trino_lib.auth.BasicAuthentication(TRINO_USER, TRINO_PASSWORD),
         verify=False,
+        http_headers=http_headers or {},
     )
-    return conn
+
+
+def _create_trino_connection():
+    """Create a Trino DBAPI connection with the hive admin/high role enabled.
+
+    Role is delivered via the ``X-Trino-Role`` request header (e.g.
+    ``hive=ROLE{admin}``) rather than ``SET ROLE``: trino-python-client 0.305 does
+    not persist a post-connect ``SET ROLE`` into subsequent statements, so the
+    session would stay on ``public`` and hit Access Denied.
+    """
+    import warnings
+    import trino as trino_lib
+    warnings.filterwarnings('ignore', '.*InsecureRequestWarning*', Warning)
+    warnings.filterwarnings('ignore', '.*Unverified HTTPS*', Warning)
+
+    _ensure_trino_host_bypasses_proxy()
+
+    # 1) 显式配置 TRINO_ROLES=hive=admin → 直接作为 X-Trino-Role 头
+    role_header = _role_header_from_config()
+
+    # 2) 兜底：查 applicable_roles，按优先级（默认 admin）选一个
+    if not role_header:
+        try:
+            probe = _raw_trino_connect(trino_lib)
+            role_header = _discover_hive_role_header(probe)
+            try:
+                probe.close()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning("Trino role discovery connection failed: %s", e)
+
+    headers = {}
+    if role_header:
+        headers["X-Trino-Role"] = role_header
+        logger.info("Trino: using X-Trino-Role=%s", role_header)
+
+    return _raw_trino_connect(trino_lib, http_headers=headers)
 
 
 def execute_trino_sql(sql, max_rows=QUERY_RESULT_MAX_ROWS, timeout=None):
@@ -667,6 +878,49 @@ def execute_trino_sql(sql, max_rows=QUERY_RESULT_MAX_ROWS, timeout=None):
         conn = _create_trino_connection()
         cursor = conn.cursor()
         running_queries[query_id] = {"cursor": cursor, "start_time": start_time, "engine": "trino"}
+
+        if _should_trino_explain(sql):
+            preflight_start = time.time()
+            pipeline_log(
+                logger,
+                "agent.execute_sql.preflight.start",
+                engine="trino",
+                sql_chars=len(sql),
+            )
+            try:
+                cursor.execute("EXPLAIN (TYPE VALIDATE) " + sql)
+                cursor.fetchall()
+            except Exception as e:
+                running_queries.pop(query_id, None)
+                err = "Trino EXPLAIN validation failed: {}".format(e)
+                pipeline_log(
+                    logger,
+                    "agent.execute_sql.preflight.done",
+                    engine="trino",
+                    ok=False,
+                    sec=time.time() - preflight_start,
+                    err=str(e)[:160],
+                )
+                ctx = format_sql_error_context(sql, str(e))
+                if ctx:
+                    logger.error(ctx)
+                return (
+                    False,
+                    [],
+                    [],
+                    err,
+                    time.time() - start_time,
+                    query_id,
+                    {"error_kind": "trino_preflight"},
+                )
+            pipeline_log(
+                logger,
+                "agent.execute_sql.preflight.done",
+                engine="trino",
+                ok=True,
+                sec=time.time() - preflight_start,
+            )
+
         logger.info("Trino query started (ID: %s)", query_id)
 
         cursor.execute(sql)
@@ -741,6 +995,9 @@ def execute_sql(sql, engine="spark", max_rows=QUERY_RESULT_MAX_ROWS, timeout=Non
     else:
         out = execute_spark_sql(sql, max_rows, timeout)
     ok, headers, results, err, exec_time, qid, _dbg = out
+    if not ok and err and is_permission_denied_error(err):
+        err = format_execution_error_for_user(err, sql=sql, engine=engine)
+        _dbg = dict(_dbg or {}, error_kind="permission_denied")
     pipeline_log(
         logger,
         "agent.execute_sql.done",
@@ -751,7 +1008,7 @@ def execute_sql(sql, engine="spark", max_rows=QUERY_RESULT_MAX_ROWS, timeout=Non
         sec=exec_time,
         err=(err[:120] if err else None),
     )
-    return out
+    return ok, headers, results, err, exec_time, qid, _dbg
 
 
 def cancel_query(query_id):

@@ -8,7 +8,7 @@
 # 切勿在 issue/PR/截图中暴露：同上，以及 shared_reports 里的业务报表链接。
 #
 # 环境文件约定（防止把真配置推进仓库）：
-#   - 一律忽略：`.env`、任意目录下的 `.env`、以及 `.env.*`（如 .env.local / .env.production）。
+#   - 一律忽略：任意目录下的 `.env*`，包括环境配置和备份副本。
 #   - 唯一例外：`.env.example`（仅占位与说明，禁止写入真实 key/密码/内网地址）。
 # -----------------------------------------------------------------------------
 
@@ -32,11 +32,15 @@ ai_service_2/temp_sql/
 **/temp_sql/
 
 # Local secrets / environment (see header: only .env.example may be committed)
-.env
-**/.env
-.env.*
+.env*
 !.env.example
 !**/.env.example
+
+# Only reviewed generic skills are published. Locally created skills remain private.
+ai_service_2/skills_pack/*/
+!ai_service_2/skills_pack/data-insights/
+!ai_service_2/skills_pack/schema-exploration/
+!ai_service_2/skills_pack/sql-rewrite/
 
 # hivebrain：保留目录结构与 README/示例 SQL 等；不提交本地数仓库表元数据
 # （由 get_spark_table_shecme_filter.py 等生成的 json、markdown 目录）
@@ -46,6 +50,13 @@ hivebrain/**/markdown/
 
 # Schema feedback learning file (runtime; may reflect your warehouse usage)
 **/data/schema_table_feedback.json
+
+# Local business funnel mappings; publish only the empty configuration template.
+ai_service_2/config/complex_query_mappings.json
+
+# Generated verification output and distributable archives
+**/test-results/
+ai_service_2/*-codex-mcp-*.zip
 
 # Python bytecode / cache / packaging
 __pycache__/

@@ -1,0 +1,34 @@
+{
+  "name": "schemist",
+  "version": "1.2.0",
+  "description": "Connect Codex to the Schemist natural-language data assistant.",
+  "author": {
+    "name": "Schemist contributors"
+  },
+  "keywords": [
+    "data analytics",
+    "text-to-sql",
+    "mcp",
+    "spark",
+    "trino"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Schemist",
+    "shortDescription": "在 Codex 中用自然语言查询 Spark 和 Trino 数据",
+    "longDescription": "连接Schemist服务，在 Codex 对话中完成自然语言转 SQL、只读执行和结果分析，并默认展示实际执行 SQL 与后台追踪信息。",
+    "developerName": "Schemist contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Analytics"
+    ],
+    "brandColor": "#146C5A",
+    "defaultPrompt": [
+      "用Schemist查询昨天的核心业务指标",
+      "用 Trino 帮我生成 SQL，但先不要执行",
+      "用 Trino 分析最近 7 天的数据趋势"
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

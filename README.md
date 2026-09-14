@@ -8,11 +8,18 @@
 
 - **Text2SQL**：自研轻量多轮 Agent（`DeepAgent`）+ 工具调用：`search_tables`、`get_table_info`，结合 BM25/规则检索与同义词扩展。
 - **双引擎执行**：只读 SQL → `spark-sql`（YARN 等由环境配置）或 Trino 连接器；校验、方言修复、超时与 Spark 会话级 SET 可配置。
+- **统一查询流水线**：Web、飞书与 MCP 复用生成 → 预校验 → 执行 → 修复 → 分析流程；支持 Trino EXPLAIN 预检、日期类型修复、权限错误终止、重复修复拦截及状态快照。
+- **生成可靠性**：限制工具轮数与重复调用，按相关性裁剪表目录，达到预算后强制输出 SQL；可配置强模型兜底与独立修复超时。
+- **复杂漏斗**：可配置多阶段检索、已确认表映射、阶段覆盖校验与缺失阶段修复；支持明确限定补充查询范围。接入说明见 [功能与配置升级](./ai_service_2/docs/FEATURE_UPGRADE.md)。
 - **Skills Pack**：`skills_pack/*/SKILL.md`（YAML frontmatter + Markdown 模板），前端或管理 API 套模板后走同一套生成链路；内置若干示例技能可仿写。
 - **Web UI + OpenAPI**：FastAPI、Jinja2 单页；健康检查、查询历史与统计、报告分享、可选 LLM 模型列表等 REST 接口。
+- **历史与追踪**：跨入口记录原始问题、实际 SQL、来源、问题编号、追踪号、查询号及客户端信息；支持筛选、复制 SQL 和查看执行快照。
+- **MCP 接入**：`POST /mcp` 提供问数、仅生成、只读执行及健康检查四个工具，可选 Bearer Token；附 Schemist 插件与 Windows/macOS/Linux 安装脚本，见 [MCP 接入说明](./ai_service_2/docs/CODEX_MCP.md)。
 - **飞书 / Lark（可选）**：事件订阅 **`POST /feishu/event`** 走与 Web 相同的生成 → 执行 → 分析链路；支持 **交互卡片** 回复、全流程成功后的 **网页分享报告**链接、与 Web 一致的 **Skills Pack**（`使用技能` / 自动匹配）。Web 端可将分析报告 **导出为飞书云文档**（需配置开放平台凭证）。对接步骤与全部环境变量见 **[飞书机器人对接说明](./ai_service_2/docs/FEISHU_BOT.md)**；飞书侧应用、权限与事件订阅以官方文档为准：[飞书开放平台 · 文档中心](https://open.feishu.cn/document)。
 
 更完整的设计说明见仓库根目录 **[技术架构设计.md](./技术架构设计.md)**（与代码目录 `ai_service_2/` 对齐的开源版架构文档）。
+
+内置 3 个通用技能：库表探索、SQL 改写、数据洞察。部署者可通过 Web/API 创建自己的技能，本地新增技能目录默认由 Git 忽略；开源贡献新的通用模板时需明确更新 `.gitignore` 中的允许列表。配置方法和本次功能清单见 [功能与配置升级](./ai_service_2/docs/FEATURE_UPGRADE.md)。
 
 ## 仓库结构
 
@@ -66,6 +73,14 @@ OpenAPI：`/docs`、`/redoc`。
 - **执行**：`SQL_EXECUTOR_TIMEOUT`、`SPARK_*`、`TRINO_*` 等见 `config/settings.py` 与 **技术架构设计.md** §5。
 
 ## 参与贡献与合规
+
+离线回归测试（在 `ai_service_2/` 目录执行）：
+
+```bash
+python tests/run_tests.py
+```
+
+测试在临时副本运行，隔离本地 `.env`、业务映射和运行数据，并禁止网络连接；无需真实 LLM、Spark 或 Trino 服务。
 
 - 提交前请确认未包含密钥、内网地址、真实业务数据导出。
 - 欢迎 Issue / PR；较大改动建议先对照 **技术架构设计.md** 中的模块边界，避免破坏「工具层 / 执行层 / 模板层」分离。

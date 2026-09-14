@@ -7,8 +7,8 @@ placeholder: 贴上要改写的 SQL，并说明目标（例如：改成 Trino、
 enabled: true
 order: 30
 tags:
-  - 优化
-  - 改写
+- 优化
+- 改写
 ---
 
 【任务】对用户给出的 SQL 做**语义等价**改写，兼顾正确性、性能与引擎兼容。
